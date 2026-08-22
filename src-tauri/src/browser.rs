@@ -35,6 +35,7 @@ pub const EXTENSION_PORT: u16 = 19876;
 
 /// One tab as reported by the extension.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtTab {
     pub tab_id: i64,
     #[serde(default)]
@@ -391,5 +392,23 @@ mod tests {
         assert!(is_internal_url("edge://newtab"));
         assert!(is_internal_url(""));
         assert!(!is_internal_url("https://example.com"));
+    }
+
+    /// The extension sends camelCase keys (tabId/windowId) — make sure the
+    /// serde rename matches the wire format.
+    #[test]
+    fn deserializes_extension_tab_snapshot() {
+        let value = serde_json::json!([
+            { "tabId": 5, "windowId": 1, "url": "https://x.com/home", "title": "Home", "active": true },
+            { "tabId": 9, "url": "https://y.com" }, // minimal fields
+        ]);
+        let tabs: Vec<ExtTab> = serde_json::from_value(value).expect("snapshot must parse");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].tab_id, 5);
+        assert_eq!(tabs[0].window_id, 1);
+        assert!(tabs[0].active);
+        assert_eq!(tabs[1].tab_id, 9);
+        assert_eq!(tabs[1].window_id, 0); // #[serde(default)]
+        assert!(!tabs[1].active);
     }
 }
