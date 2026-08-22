@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body {
+      width: 280px;
+      margin: 0;
+      padding: 14px;
+      font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 13px;
+      color: #1f2937;
+    }
+    h1 { font-size: 14px; margin: 0 0 4px; }
+    .status { margin: 8px 0 12px; padding: 6px 10px; border-radius: 6px; font-size: 12px; }
+    .status.ok { background: #dcfce7; color: #166534; }
+    .status.bad { background: #fee2e2; color: #991b1b; }
+    label { display: block; margin-bottom: 4px; font-size: 12px; color: #6b7280; }
+    input {
+      width: 100%; box-sizing: border-box; padding: 6px 8px;
+      border: 1px solid #d1d5db; border-radius: 6px;
+      font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    button {
+      flex: 1; padding: 7px 0; border: 0; border-radius: 6px;
+      background: #6366f1; color: #fff; font-size: 13px; cursor: pointer;
+    }
+    button.secondary { background: #e5e7eb; color: #374151; }
+    .hint { margin-top: 10px; font-size: 11px; color: #9ca3af; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>TabFlow 配对</h1>
+  <div id="status" class="status bad">检查连接中…</div>
+
+  <label for="token">配对 Token（在 TabFlow 概览页复制）</label>
+  <input id="token" placeholder="粘贴 Token" autocomplete="off" />
+
+  <div class="row">
+    <button id="save" class="secondary">保存</button>
+    <button id="reconnect">重新连接</button>
+  </div>
+
+  <p class="hint">
+    Token 在 TabFlow 桌面应用「概览」页的扩展状态区域显示。保存后扩展会自动
+    连接，之后无需再次操作。数据仅在本机（127.0.0.1）传输。
+  </p>
+
+  <script src="popup.js"></script>
+</body>
+</html>

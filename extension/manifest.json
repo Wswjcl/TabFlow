@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "TabFlow Companion",
+  "version": "0.1.0",
+  "description": "向 TabFlow 桌面应用推送浏览器标签页数据，实现标签页级别的统计与管理。",
+  "permissions": ["tabs", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TabFlow 配对"
+  }
+}
