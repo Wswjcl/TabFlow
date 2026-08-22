@@ -39,6 +39,15 @@ export interface Stats {
 
 // ─── Item type helpers ─────────────────────────────
 
+// Sidebar type-filter pseudo task ids (kept distinct from real task UUIDs)
+export const FILTER_BROWSER = "__filter_browser";
+export const FILTER_EXPLORER = "__filter_explorer";
+export const FILTER_APP = "__filter_app";
+
+export function isFilterId(id: string | null): id is string {
+  return id != null && id.startsWith("__filter_");
+}
+
 export function itemTypeLabel(type: string): string {
   switch (type) {
     case "browser_tab":

@@ -1,7 +1,7 @@
 import { useWindowStore } from "@/stores";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Globe, FolderOpen, Monitor, CopyX, Layers, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { Globe, FolderOpen, Monitor, CopyX, Layers, RefreshCw, Wifi, WifiOff, Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -14,12 +14,27 @@ export function Dashboard({ onRefresh, lastRefresh }: Props) {
   const { stats, duplicates, loading, error } = useWindowStore();
   const dupCount = duplicates.reduce((s, g) => s + g.items.length - 1, 0);
   const [cdpOn, setCdpOn] = useState(false);
+  const [launching, setLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<boolean>("check_cdp_status")
       .then(setCdpOn)
       .catch(() => setCdpOn(false));
   }, [lastRefresh]);
+
+  const handleLaunchDebugBrowser = async () => {
+    setLaunching(true);
+    setLaunchError(null);
+    try {
+      await invoke<string>("launch_browser_debug");
+      await onRefresh();
+    } catch (e) {
+      setLaunchError(String(e));
+    } finally {
+      setLaunching(false);
+    }
+  };
 
   return (
     <div className="px-4 py-3 border-b border-border/50 shrink-0">
@@ -32,13 +47,37 @@ export function Dashboard({ onRefresh, lastRefresh }: Props) {
           {error && (
             <span className="text-xs text-destructive">加载失败</span>
           )}
-          <span
-            className={`text-[10px] flex items-center gap-1 ${cdpOn ? "text-green-500" : "text-muted-foreground/40"}`}
-            title={cdpOn ? "CDP 已连接" : "CDP 未连接 — 浏览器需以调试模式启动"}
-          >
-            {cdpOn ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
-            {cdpOn ? "标签页模式" : "窗口模式"}
-          </span>
+          {cdpOn ? (
+            <span
+              className="text-[10px] flex items-center gap-1 text-green-500"
+              title="CDP 已连接"
+            >
+              <Wifi className="w-3 h-3" />
+              标签页模式
+            </span>
+          ) : (
+            <button
+              onClick={handleLaunchDebugBrowser}
+              disabled={launching}
+              title="浏览器需以调试模式启动才能读取标签页。注意：若浏览器已在运行，请先完全退出再点击。"
+              className="text-[10px] flex items-center gap-1 text-muted-foreground/60 hover:text-foreground transition-colors disabled:opacity-50"
+            >
+              {launching ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <WifiOff className="w-3 h-3" />
+              )}
+              {launching ? "启动中…" : "窗口模式 · 点击启动调试浏览器"}
+            </button>
+          )}
+          {launchError && (
+            <span
+              className="text-[10px] text-destructive max-w-[240px] truncate"
+              title={launchError}
+            >
+              {launchError}
+            </span>
+          )}
           {lastRefresh && !loading && (
             <span className="text-[10px] text-muted-foreground/60">{lastRefresh}</span>
           )}

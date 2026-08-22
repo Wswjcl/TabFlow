@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { TrackedItem, DuplicateGroup, Task, Stats } from "./types";
+import { isFilterId } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 
 // ─── Pending Removals ──────────────────────────────
@@ -18,7 +19,7 @@ interface WindowState {
 
   refresh: (silent?: boolean) => Promise<void>;
   detectDuplicates: () => Promise<void>;
-  closeDuplicates: (groupIds: string[], keepIndices?: number[]) => number;
+  closeDuplicates: (groupIds: string[], keepItemIds?: string[]) => number;
   focusWindow: (itemId: string) => Promise<void>;
   closeWindow: (itemId: string) => void;
 }
@@ -59,15 +60,19 @@ export const useWindowStore = create<WindowState>((set, get) => ({
     }
   },
 
-  closeDuplicates: (groupIds, keepIndices) => {
+  closeDuplicates: (groupIds, keepItemIds) => {
     const matchedGroups = get().duplicates.filter((g) =>
       groupIds.includes(g.id) || groupIds.includes(g.match_pattern)
     );
-    const keepIdx = keepIndices?.[0] ?? 0;
+    const keepSet = new Set(keepItemIds ?? []);
     const removedIds: string[] = [];
     for (const g of matchedGroups) {
+      // Mirror the backend: when explicit keep ids are given, keep those;
+      // otherwise keep the first item of each group.
+      const hasKeep = g.items.some((it) => keepSet.has(it.id));
       for (let i = 0; i < g.items.length; i++) {
-        if (i !== keepIdx) {
+        const keep = hasKeep ? keepSet.has(g.items[i].id) : i === 0;
+        if (!keep) {
           removedIds.push(g.items[i].id);
           pendingRemovals.add(g.items[i].id);
         }
@@ -84,7 +89,7 @@ export const useWindowStore = create<WindowState>((set, get) => ({
     });
 
     // Fire-and-forget: close on backend, don't await
-    invoke<number>("close_duplicates", { groupIds, keepIndices })
+    invoke<number>("close_duplicates", { groupIds, keepItemIds })
       .then(() => {
         // Delay clearing pendingRemovals so CDP close has time to take effect
         setTimeout(() => {
@@ -162,9 +167,11 @@ export const useWindowStore = create<WindowState>((set, get) => ({
 interface TaskState {
   tasks: Task[];
   selectedTaskId: string | null;
+  /** Live tracked items belonging to the selected real task */
+  taskItems: TrackedItem[];
 
   loadTasks: () => Promise<void>;
-  selectTask: (taskId: string | null) => void;
+  selectTask: (taskId: string | null) => Promise<void>;
   createTask: (name: string, color: string) => Promise<void>;
   updateTask: (id: string, name: string, color: string) => Promise<void>;
   deleteTask: (id: string) => Promise<void>;
@@ -175,17 +182,38 @@ interface TaskState {
 export const useTaskStore = create<TaskState>((set, get) => ({
   tasks: [],
   selectedTaskId: null,
+  taskItems: [],
 
   loadTasks: async () => {
     try {
       const tasks = await invoke<Task[]>("get_all_tasks");
       set({ tasks });
+      // Refresh the selected task's live items (counts may have changed)
+      const selected = get().selectedTaskId;
+      if (selected && !isFilterId(selected)) {
+        const items = await invoke<TrackedItem[]>("get_task_items", { taskId: selected });
+        if (get().selectedTaskId === selected) set({ taskItems: items });
+      }
     } catch (e) {
       console.error("Failed to load tasks:", e);
     }
   },
 
-  selectTask: (taskId) => set({ selectedTaskId: taskId }),
+  selectTask: async (taskId) => {
+    set({ selectedTaskId: taskId });
+    if (taskId && !isFilterId(taskId)) {
+      try {
+        const items = await invoke<TrackedItem[]>("get_task_items", { taskId });
+        // Guard against races when the user switches quickly
+        if (get().selectedTaskId === taskId) set({ taskItems: items });
+      } catch (e) {
+        console.error("Failed to load task items:", e);
+        set({ taskItems: [] });
+      }
+    } else {
+      set({ taskItems: [] });
+    }
+  },
 
   createTask: async (name, color) => {
     try {

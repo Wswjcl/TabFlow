@@ -24,9 +24,17 @@ export function TaskPanel() {
   return (
     <div className="space-y-0.5">
       {tasks.map((task) => (
-        <button
+        <div
           key={task.id}
+          role="button"
+          tabIndex={0}
           onClick={() => selectTask(selectedTaskId === task.id ? null : task.id)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              selectTask(selectedTaskId === task.id ? null : task.id);
+            }
+          }}
           className={`
             group flex items-center gap-2.5 w-full px-2 py-1.5 rounded-md text-sm
             transition-all duration-150 cursor-pointer
@@ -56,11 +64,12 @@ export function TaskPanel() {
               e.stopPropagation();
               deleteTask(task.id);
             }}
+            title="删除 Task"
             className="opacity-0 group-hover:opacity-100 hover:text-destructive transition-all shrink-0"
           >
             <Trash2 className="w-3 h-3" />
           </button>
-        </button>
+        </div>
       ))}
 
       {/* Add task button */}

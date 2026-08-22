@@ -36,18 +36,15 @@ export function AppShell() {
       detectDuplicates();
     }).then((fn) => unlisteners.push(fn));
 
-    // Global keyboard shortcut: Ctrl+Shift+F
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key === "F") {
-        e.preventDefault();
-        setSearchOpen(!useUIStore.getState().searchOpen);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
+    // System-wide Ctrl+Shift+F (registered by the Rust side) toggles search.
+    // Replaces the old webview-only keydown listener, which failed whenever
+    // the TabFlow window lost focus.
+    listen("toggle-search", () => {
+      setSearchOpen(!useUIStore.getState().searchOpen);
+    }).then((fn) => unlisteners.push(fn));
 
     return () => {
       unlisteners.forEach((fn) => fn());
-      window.removeEventListener("keydown", handleKeyDown);
     };
   }, []);
 

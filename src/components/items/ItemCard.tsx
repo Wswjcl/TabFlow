@@ -2,7 +2,6 @@ import React from "react";
 import { useWindowStore, useTaskStore } from "@/stores";
 import { Button } from "@/components/ui/button";
 import {
-  GripVertical,
   ExternalLink,
   X,
   Copy,
@@ -12,11 +11,9 @@ import { itemTypeIcon, browserIcon } from "@/stores/types";
 
 interface ItemCardProps {
   item: TrackedItem;
-  isDragging?: boolean;
-  dragHandleProps?: Record<string, unknown>;
 }
 
-export function ItemCard({ item, isDragging, dragHandleProps }: ItemCardProps) {
+export function ItemCard({ item }: ItemCardProps) {
   const { focusWindow, closeWindow } = useWindowStore();
   const { selectedTaskId } = useTaskStore();
 
@@ -51,19 +48,10 @@ export function ItemCard({ item, isDragging, dragHandleProps }: ItemCardProps) {
         group flex items-center gap-2 px-3 py-2 rounded-md
         transition-all duration-150 cursor-pointer
         hover:bg-accent/70
-        ${isDragging ? "opacity-50 shadow-lg" : ""}
         ${selectedTaskId ? "border border-transparent" : ""}
       `}
       onClick={handleClick}
     >
-      {/* Drag handle */}
-      <button
-        className="drag-handle shrink-0 p-0.5"
-        {...((dragHandleProps || {}) as React.HTMLAttributes<HTMLButtonElement>)}
-      >
-        <GripVertical className="w-3.5 h-3.5" />
-      </button>
-
       {/* Icon */}
       <span className="text-sm shrink-0">{icon}</span>
 

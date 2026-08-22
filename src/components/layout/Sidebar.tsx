@@ -1,5 +1,6 @@
 import React from "react";
 import { useTaskStore, useUIStore } from "@/stores";
+import { FILTER_APP, FILTER_BROWSER, FILTER_EXPLORER } from "@/stores/types";
 import { TaskPanel } from "@/components/tasks/TaskPanel";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -70,20 +71,20 @@ export function Sidebar() {
           <SidebarItem
             icon={<Globe className="w-4 h-4" />}
             label="浏览器标签"
-            active={selectedTaskId === "__filter_browser"}
-            onClick={() => selectTask("__filter_browser")}
+            active={selectedTaskId === FILTER_BROWSER}
+            onClick={() => selectTask(FILTER_BROWSER)}
           />
           <SidebarItem
             icon={<FolderOpen className="w-4 h-4" />}
             label="文件管理器"
-            active={selectedTaskId === "__filter_explorer"}
-            onClick={() => selectTask("__filter_explorer")}
+            active={selectedTaskId === FILTER_EXPLORER}
+            onClick={() => selectTask(FILTER_EXPLORER)}
           />
           <SidebarItem
             icon={<Monitor className="w-4 h-4" />}
             label="应用窗口"
-            active={selectedTaskId === "__filter_app"}
-            onClick={() => selectTask("__filter_app")}
+            active={selectedTaskId === FILTER_APP}
+            onClick={() => selectTask(FILTER_APP)}
           />
         </div>
 

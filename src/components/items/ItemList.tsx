@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useWindowStore, useTaskStore } from "@/stores";
+import { FILTER_APP, FILTER_BROWSER, FILTER_EXPLORER } from "@/stores/types";
 import { ItemCard } from "./ItemCard";
 import { DuplicateGroup } from "./DuplicateGroup";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -8,21 +9,26 @@ import { Sparkles, AlertCircle, Loader2 } from "lucide-react";
 
 export function ItemList() {
   const { items, duplicates, loading, error, closeDuplicates } = useWindowStore();
-  const { selectedTaskId } = useTaskStore();
+  const { selectedTaskId, taskItems } = useTaskStore();
 
   // Filter by selected task/type
   const filtered = useMemo(() => {
-    if (selectedTaskId === "__filter_browser") {
+    if (selectedTaskId === FILTER_BROWSER) {
       return items.filter((i) => i.item_type === "browser_tab");
     }
-    if (selectedTaskId === "__filter_explorer") {
+    if (selectedTaskId === FILTER_EXPLORER) {
       return items.filter((i) => i.item_type === "explorer_window");
     }
-    if (selectedTaskId === "__filter_app") {
+    if (selectedTaskId === FILTER_APP) {
       return items.filter((i) => i.item_type === "app_window");
     }
+    if (selectedTaskId) {
+      // Real task: show its assigned live items
+      const ids = new Set(taskItems.map((i) => i.id));
+      return items.filter((i) => ids.has(i.id));
+    }
     return items;
-  }, [items, selectedTaskId]);
+  }, [items, selectedTaskId, taskItems]);
 
   // Items that are part of duplicate groups
   const dupItemIds = useMemo(() => {
