@@ -1,4 +1,3 @@
-use crate::cdp;
 use crate::db;
 use crate::platform::{DuplicateGroup, TrackedItem, ItemType};
 use uuid::Uuid;
@@ -171,8 +170,8 @@ pub async fn close_duplicates(
                 }
 
                 let did_close = if item.item_type == ItemType::BrowserTab {
-                    // Close browser tab via CDP
-                    cdp::close_cdp_tab(&item.id).await
+                    // Close browser tab via extension or CDP
+                    crate::browser::close_any_tab(&item.id).await
                 } else if let Some(hwnd) = item.window_handle {
                     if item.item_type == ItemType::ExplorerWindow
                         && !crate::platform::can_close_explorer_window(hwnd, &all_items)

@@ -23,6 +23,10 @@ pub fn run() {
                 db::init_db(data_dir).await.expect("Failed to initialize database");
             });
 
+            // WebSocket server for the browser extension (tab-level data
+            // from normally-running browsers; no debug flag needed)
+            browser::start_extension_server(app.handle().clone());
+
             // System-wide Ctrl+Shift+F toggles the search overlay.
             // The webview listens for the "toggle-search" event. Registration
             // failure (hotkey already taken) only logs — the UI keeps working.
@@ -41,6 +45,7 @@ pub fn run() {
             monitor::get_all_windows,
             monitor::get_tracked_items,
             cdp::check_cdp_status,
+            browser::get_extension_status,
             duplicate::detect_duplicates,
             duplicate::close_duplicates,
             actions::focus_window,

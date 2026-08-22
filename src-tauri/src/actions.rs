@@ -11,9 +11,9 @@ pub async fn focus_window(item_id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     if let Some(item) = items.iter().find(|i| i.id == item_id) {
-        // Browser tab: focus via CDP
+        // Browser tab: focus via extension (preferred) or CDP
         if item.item_type == ItemType::BrowserTab {
-            let ok = cdp::focus_cdp_tab(&item.id).await;
+            let ok = crate::browser::focus_any_tab(&item.id).await;
             if ok {
                 let _ = db::touch_item(&item_id).await;
                 return Ok(());
@@ -48,9 +48,9 @@ pub async fn close_window(item_id: String) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
 
     if let Some(item) = items.iter().find(|i| i.id == item_id) {
-        // Browser tab: close via CDP
+        // Browser tab: close via extension (preferred) or CDP
         if item.item_type == ItemType::BrowserTab {
-            let ok = cdp::close_cdp_tab(&item.id).await;
+            let ok = crate::browser::close_any_tab(&item.id).await;
             // Delete from DB regardless — next scan will re-add if still open
             let _ = db::delete_tracked_item(&item_id).await;
             return Ok(ok);

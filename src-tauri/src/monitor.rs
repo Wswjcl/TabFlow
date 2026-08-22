@@ -1,6 +1,8 @@
 use crate::platform::{self, TrackedItem, ItemType};
 use crate::db;
 use crate::cdp;
+use crate::browser;
+use std::collections::HashSet;
 use tokio::sync::Mutex;
 
 /// Serializes scans: two overlapping get_tracked_items calls (manual refresh
@@ -12,13 +14,28 @@ static SCAN_MUTEX: Mutex<()> = Mutex::const_new(());
 pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
     let _guard = SCAN_MUTEX.lock().await;
 
-    // 1. Scan browser tabs via CDP (real URLs, all tabs)
-    let cdp_tabs = cdp::fetch_browser_tabs().await;
+    // 1. Browser tabs from connected extensions (works on normally-running
+    //    browsers) — they take priority over CDP for the same browser so the
+    //    same tab never appears twice.
+    let ext_tabs = browser::get_extension_tabs().await;
+    let ext_browsers: HashSet<String> = browser::connected_browsers().await.into_iter().collect();
 
-    // 2. Scan windows via EnumWindows (file explorer, apps — browser main windows excluded)
+    // 2. CDP tabs (requires debug mode) for browsers WITHOUT an extension
+    let cdp_tabs: Vec<TrackedItem> = cdp::fetch_browser_tabs()
+        .await
+        .into_iter()
+        .filter(|t| {
+            t.browser_name
+                .as_deref()
+                .map(|b| !ext_browsers.contains(b))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    // 3. Scan windows via EnumWindows (file explorer, apps — browser main windows excluded)
     let mut window_items = platform::enumerate_windows();
 
-    // 3. Explorer tabs via the Shell COM collection (real paths, Win11
+    // 4. Explorer tabs via the Shell COM collection (real paths, Win11
     //    per-tab). When COM succeeds it supersedes the EnumWindows
     //    approximation (title-as-path, one entry per window); on failure we
     //    keep the approximation as fallback.
@@ -31,8 +48,9 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
         Err(e) => eprintln!("Explorer COM enumeration failed, falling back to EnumWindows: {:?}", e),
     }
 
-    // 4. Merge: CDP tabs (if available) + explorer tabs + non-browser windows
+    // 5. Merge: extension tabs + CDP tabs (if any) + explorer tabs + windows
     let mut all_items: Vec<TrackedItem> = Vec::new();
+    all_items.extend(ext_tabs);
     let has_cdp = !cdp_tabs.is_empty();
 
     if has_cdp {
