@@ -37,6 +37,19 @@ export interface Stats {
   active_tasks: number;
 }
 
+// ─── Extension channel ─────────────────────────────
+
+export interface ConnectedBrowser {
+  browser: string;
+  tabCount: number;
+}
+
+export interface ExtensionStatus {
+  port: number;
+  token: string;
+  connected: ConnectedBrowser[];
+}
+
 // ─── Item type helpers ─────────────────────────────
 
 // Sidebar type-filter pseudo task ids (kept distinct from real task UUIDs)

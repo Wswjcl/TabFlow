@@ -1,7 +1,8 @@
 import { useWindowStore } from "@/stores";
+import type { ExtensionStatus } from "@/stores/types";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Globe, FolderOpen, Monitor, CopyX, Layers, RefreshCw, Wifi, WifiOff, Loader2 } from "lucide-react";
+import { Globe, FolderOpen, Monitor, CopyX, Layers, RefreshCw, Wifi, WifiOff, Loader2, Puzzle, Copy, Check } from "lucide-react";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -16,12 +17,31 @@ export function Dashboard({ onRefresh, lastRefresh }: Props) {
   const [cdpOn, setCdpOn] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [ext, setExt] = useState<ExtensionStatus | null>(null);
+  const [pairingOpen, setPairingOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     invoke<boolean>("check_cdp_status")
       .then(setCdpOn)
       .catch(() => setCdpOn(false));
+    invoke<ExtensionStatus>("get_extension_status")
+      .then(setExt)
+      .catch(() => setExt(null));
   }, [lastRefresh]);
+
+  const extConnected = ext != null && ext.connected.length > 0;
+
+  const copyToken = async () => {
+    if (!ext) return;
+    try {
+      await navigator.clipboard.writeText(ext.token);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
 
   const handleLaunchDebugBrowser = async () => {
     setLaunching(true);
@@ -70,6 +90,25 @@ export function Dashboard({ onRefresh, lastRefresh }: Props) {
               {launching ? "启动中…" : "窗口模式 · 点击启动调试浏览器"}
             </button>
           )}
+          {extConnected ? (
+            <span
+              className="text-[10px] flex items-center gap-1 text-green-500 max-w-[200px] truncate"
+              title={ext!.connected.map((c) => `${c.browser}: ${c.tabCount} 个标签`).join("\n")}
+            >
+              <Puzzle className="w-3 h-3 shrink-0" />
+              扩展:{" "}
+              {ext!.connected.map((c) => `${c.browser}(${c.tabCount})`).join(" · ")}
+            </span>
+          ) : (
+            <button
+              onClick={() => setPairingOpen(!pairingOpen)}
+              title="安装 TabFlow 浏览器扩展后可实时获取标签页（无需调试模式）"
+              className="text-[10px] flex items-center gap-1 text-muted-foreground/60 hover:text-foreground transition-colors"
+            >
+              <Puzzle className="w-3 h-3" />
+              扩展未连接 · 配对
+            </button>
+          )}
           {launchError && (
             <span
               className="text-[10px] text-destructive max-w-[240px] truncate"
@@ -93,6 +132,33 @@ export function Dashboard({ onRefresh, lastRefresh }: Props) {
           刷新
         </Button>
       </div>
+
+      {/* Extension pairing panel */}
+      {pairingOpen && ext && !extConnected && (
+        <div className="mb-2 flex items-center gap-2 flex-wrap text-[11px] text-muted-foreground bg-muted/50 rounded-md px-3 py-2">
+          <Puzzle className="w-3.5 h-3.5 shrink-0" />
+          <span>
+            在浏览器中加载 <code>tabflow/extension</code> 扩展
+            （扩展管理页 → 开发者模式 → 加载已解压的扩展程序），
+            然后将下面的 Token 粘贴进扩展弹窗完成配对：
+          </span>
+          <code className="px-1.5 py-0.5 rounded bg-background border font-mono select-all">
+            {ext.token}
+          </code>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 px-2 text-[11px] gap-1"
+            onClick={copyToken}
+          >
+            {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+            {copied ? "已复制" : "复制"}
+          </Button>
+          <span className="ml-auto text-[10px] opacity-60">
+            ws://127.0.0.1:{ext.port} · 数据仅本机传输
+          </span>
+        </div>
+      )}
 
       <div className="flex items-center gap-3 overflow-x-auto pb-1">
         <MiniStat label="总窗口" value={stats?.total_items ?? 0} icon={<Layers className="w-3.5 h-3.5" />} />
