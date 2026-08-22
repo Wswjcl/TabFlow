@@ -126,13 +126,29 @@ fn close_window_by_handle(hwnd: i64) -> bool {
 /// Tries Edge first (usually available on Windows), then Chrome.
 /// Returns the browser name that was launched, or an error if none could be
 /// started with a working debug port.
+///
+/// `isolated = true` launches with a dedicated `--user-data-dir` — required
+/// for Chrome/Edge 136+, which ignore `--remote-debugging-port` on the
+/// default profile. Note the isolated profile has none of the user's logins
+/// or extensions; for managing the user's real tabs prefer the companion
+/// extension (works on normally-running browsers).
 #[tauri::command]
-pub async fn launch_browser_debug() -> Result<String, String> {
+pub async fn launch_browser_debug(isolated: Option<bool>) -> Result<String, String> {
     let port = 9222;
+    let isolated = isolated.unwrap_or(false);
 
     if cdp::is_debug_port_open(port).await {
         return Ok("调试模式已开启".to_string());
     }
+
+    let isolated_dir = if isolated {
+        let dir = isolated_profile_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("无法创建调试配置目录 {}: {}", dir.display(), e))?;
+        Some(dir)
+    } else {
+        None
+    };
 
     let mut candidates: Vec<(std::path::PathBuf, &str)> = Vec::new();
 
@@ -165,9 +181,12 @@ pub async fn launch_browser_debug() -> Result<String, String> {
             continue;
         }
         last_browser = name.to_string();
-        std::process::Command::new(path)
-            .arg(format!("--remote-debugging-port={}", port))
-            .spawn()
+        let mut cmd = std::process::Command::new(path);
+        cmd.arg(format!("--remote-debugging-port={}", port));
+        if let Some(dir) = &isolated_dir {
+            cmd.arg(format!("--user-data-dir={}", dir.display()));
+        }
+        cmd.spawn()
             .map_err(|e| format!("Failed to launch {}: {}", name, e))?;
 
         // Wait for the debug port to come up. Note: when a browser instance is
@@ -182,11 +201,33 @@ pub async fn launch_browser_debug() -> Result<String, String> {
     }
 
     if !last_browser.is_empty() {
-        return Err(format!(
-            "已启动 {} 但调试端口未开启：浏览器可能已在运行，请完全退出浏览器后重试",
-            last_browser
-        ));
+        return Err(if isolated {
+            format!(
+                "已启动 {} 但调试端口未开启：浏览器可能已在运行，请完全退出浏览器后重试",
+                last_browser
+            )
+        } else {
+            format!(
+                "已启动 {} 但调试端口未开启。可能原因：\
+                 ① 浏览器已在运行（请完全退出后重试）；\
+                 ② Chrome/Edge 136+ 出于安全考虑禁止在默认配置文件上开启调试端口。\
+                 推荐改用 TabFlow 浏览器扩展（概览页「扩展未连接 · 配对」），\
+                 无需调试模式即可实时管理标签页",
+                last_browser
+            )
+        });
     }
 
     Err("未找到 Edge 或 Chrome，请手动启动浏览器并添加 --remote-debugging-port=9222 参数".to_string())
+}
+
+fn isolated_profile_dir() -> std::path::PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return std::path::PathBuf::from(local)
+            .join("TabFlow")
+            .join("debug-profile");
+    }
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join("tabflow-debug-profile")
 }
