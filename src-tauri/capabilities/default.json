@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for TabFlow",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "global-shortcut:default",
+    "notification:default"
+  ]
+}
