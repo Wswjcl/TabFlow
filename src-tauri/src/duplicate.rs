@@ -149,10 +149,10 @@ pub async fn close_duplicates(
     group_ids: Vec<String>,
     keep_item_ids: Option<Vec<String>>,
 ) -> Result<usize, String> {
-    // Recompute groups from live data
-    let all_groups = find_duplicates(
-        &db::get_all_tracked_items().await.map_err(|e| e.to_string())?,
-    );
+    // Recompute groups from live data (keep the raw list: closing an
+    // Explorer tab may only close its window when no sibling tabs exist)
+    let all_items = db::get_all_tracked_items().await.map_err(|e| e.to_string())?;
+    let all_groups = find_duplicates(&all_items);
 
     let keeps: HashSet<String> = keep_item_ids.unwrap_or_default().into_iter().collect();
     let keep_explicit = !keeps.is_empty();
@@ -174,7 +174,15 @@ pub async fn close_duplicates(
                     // Close browser tab via CDP
                     cdp::close_cdp_tab(&item.id).await
                 } else if let Some(hwnd) = item.window_handle {
-                    close_single_window(hwnd)
+                    if item.item_type == ItemType::ExplorerWindow
+                        && !crate::platform::can_close_explorer_window(hwnd, &all_items)
+                    {
+                        // Multi-tab window: closing the shared HWND would
+                        // kill sibling tabs — leave it to the user.
+                        false
+                    } else {
+                        close_single_window(hwnd)
+                    }
                 } else {
                     false
                 };

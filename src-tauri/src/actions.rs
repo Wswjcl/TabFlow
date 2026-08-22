@@ -58,6 +58,13 @@ pub async fn close_window(item_id: String) -> Result<bool, String> {
 
         // Regular window: close by handle
         if let Some(hwnd) = item.window_handle {
+            if item.item_type == ItemType::ExplorerWindow
+                && !platform::can_close_explorer_window(hwnd, &items)
+            {
+                // Multi-tab Explorer window: closing the shared HWND would
+                // kill sibling tabs — refuse instead.
+                return Ok(false);
+            }
             let closed = close_window_by_handle(hwnd);
             // Always delete from DB — next scan will re-add if still open
             let _ = db::delete_tracked_item(&item_id).await;

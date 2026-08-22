@@ -18,7 +18,20 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
     // 2. Scan windows via EnumWindows (file explorer, apps — browser main windows excluded)
     let mut window_items = platform::enumerate_windows();
 
-    // 3. Merge: CDP tabs (if available) + non-browser windows
+    // 3. Explorer tabs via the Shell COM collection (real paths, Win11
+    //    per-tab). When COM succeeds it supersedes the EnumWindows
+    //    approximation (title-as-path, one entry per window); on failure we
+    //    keep the approximation as fallback.
+    let mut explorer_tabs: Vec<TrackedItem> = Vec::new();
+    match platform::enumerate_explorer_items() {
+        Ok(tabs) => {
+            explorer_tabs = tabs;
+            window_items.retain(|it| it.item_type != ItemType::ExplorerWindow);
+        }
+        Err(e) => eprintln!("Explorer COM enumeration failed, falling back to EnumWindows: {:?}", e),
+    }
+
+    // 4. Merge: CDP tabs (if available) + explorer tabs + non-browser windows
     let mut all_items: Vec<TrackedItem> = Vec::new();
     let has_cdp = !cdp_tabs.is_empty();
 
@@ -43,12 +56,14 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
         all_items.extend(window_items);
     }
 
-    // 4. Atomically store & clean up stale rows
+    all_items.extend(explorer_tabs);
+
+    // 5. Atomically store & clean up stale rows
     if let Err(e) = db::sync_items(&all_items).await {
         eprintln!("Failed to sync items: {}", e);
     }
 
-    // 5. Return from DB
+    // 6. Return from DB
     db::get_all_tracked_items()
         .await
         .map_err(|e| e.to_string())
