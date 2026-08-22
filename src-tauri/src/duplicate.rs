@@ -1,54 +1,122 @@
 use crate::cdp;
-use crate::platform::{DuplicateGroup, TrackedItem, ItemType};
 use crate::db;
+use crate::platform::{DuplicateGroup, TrackedItem, ItemType};
 use uuid::Uuid;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Detect duplicate windows/tabs from DB
 #[tauri::command]
 pub async fn detect_duplicates() -> Result<Vec<DuplicateGroup>, String> {
     db::detect_and_store_duplicates()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let items = db::get_all_tracked_items().await.map_err(|e| e.to_string())?;
+    Ok(find_duplicates(&items))
 }
 
-/// Internal duplicate detection logic using provided items
+/// Stable identity of an item, independent of the window instance:
+/// a URL / explorer path / process+title. Used for duplicate grouping and
+/// for task assignments (which must survive the window closing).
+pub fn resource_key(item: &TrackedItem) -> String {
+    match &item.item_type {
+        ItemType::BrowserTab => {
+            if let Some(ref url) = item.url {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    format!("url:{}", normalize_url(url))
+                } else {
+                    // Pseudo-URL from the title fallback ("page:...")
+                    format!("url:{}", url.trim_end_matches('/').to_lowercase())
+                }
+            } else {
+                format!("browser_standalone:{}", item.id)
+            }
+        }
+        ItemType::ExplorerWindow => item
+            .path
+            .as_ref()
+            .map(|p| format!("path:{}", p.to_lowercase()))
+            .unwrap_or_else(|| format!("explorer_standalone:{}", item.id)),
+        ItemType::AppWindow => format!(
+            "app:{}:{}",
+            item.process_name.to_lowercase(),
+            item.title.to_lowercase()
+        ),
+    }
+}
+
+/// Normalize a URL for duplicate comparison:
+/// - treat http and https as equivalent, lowercase scheme+host
+/// - drop the fragment (#...)
+/// - strip known tracking query params (utm_*, gclid, ...) while keeping
+///   meaningful ones (e.g. search queries) so different searches still differ
+/// - trim trailing slashes
+fn normalize_url(url: &str) -> String {
+    let no_fragment = url.split('#').next().unwrap_or(url);
+    let (base, query) = match no_fragment.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (no_fragment, None),
+    };
+
+    let mut base_lower = base.to_lowercase();
+    if let Some(rest) = base_lower.strip_prefix("https://") {
+        base_lower = format!("http://{}", rest);
+    }
+    let base_trimmed = base_lower.trim_end_matches('/');
+
+    let filtered_query = query
+        .map(|q| {
+            let kept: Vec<&str> = q.split('&').filter(|kv| {
+                let key = kv.split('=').next().unwrap_or("");
+                !is_tracking_param(key)
+            }).collect();
+            if kept.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", kept.join("&"))
+            }
+        })
+        .unwrap_or_default();
+
+    format!("{}{}", base_trimmed, filtered_query)
+}
+
+fn is_tracking_param(key: &str) -> bool {
+    key.starts_with("utm_")
+        || matches!(
+            key,
+            "gclid" | "fbclid" | "mc_cid" | "mc_eid" | "ref" | "referrer" | "spm" | "scm" | "igshid"
+        )
+}
+
+/// Internal duplicate detection logic using provided items.
+/// Items inside a group and the group list itself are sorted deterministically
+/// so that "keep the first item" means the same thing on every recompute.
 pub fn find_duplicates(items: &[TrackedItem]) -> Vec<DuplicateGroup> {
     let mut groups: HashMap<String, Vec<TrackedItem>> = HashMap::new();
 
     for item in items {
-        let key = match &item.item_type {
-            ItemType::BrowserTab => {
-                if let Some(ref url) = item.url {
-                    let normalized = url.trim_end_matches('/').to_lowercase();
-                    format!("url:{}", normalized)
-                } else {
-                    // No URL extracted → don't group with anything
-                    // Each untagged browser window is unique
-                    format!("browser_standalone:{}", item.id)
-                }
-            }
-            ItemType::ExplorerWindow => {
-                if let Some(ref path) = item.path {
-                    format!("path:{}", path.to_lowercase())
-                } else {
-                    format!("explorer_standalone:{}", item.id)
-                }
-            }
-            ItemType::AppWindow => {
-                // Only group app windows if title + process both match
-                format!("app:{}:{}", item.process_name, item.title.to_lowercase())
-            }
-        };
-
-        groups.entry(key).or_insert_with(Vec::new).push(item.clone());
+        groups
+            .entry(resource_key(item))
+            .or_insert_with(Vec::new)
+            .push(item.clone());
     }
+
+    let mut groups: Vec<(String, Vec<TrackedItem>)> = groups.into_iter().collect();
+    for (_, group_items) in groups.iter_mut() {
+        group_items.sort_by(|a, b| {
+            b.last_active_at
+                .cmp(&a.last_active_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
 
     groups
         .into_iter()
-        .filter(|(_, items)| items.len() > 1)
-        .map(|(key, items)| {
-            let count = items.len();
+        .filter(|(_, group_items)| group_items.len() > 1)
+        .map(|(key, group_items)| {
+            let count = group_items.len();
             let match_type = if key.starts_with("url:") {
                 "url_exact"
             } else if key.starts_with("path:") {
@@ -63,57 +131,59 @@ pub fn find_duplicates(items: &[TrackedItem]) -> Vec<DuplicateGroup> {
                 id: Uuid::new_v4().to_string(),
                 match_type: match_type.to_string(),
                 match_pattern: key,
-                items,
+                items: group_items,
                 count,
             }
         })
         .collect()
 }
 
-/// Close all items in a duplicate group except the first one.
-/// Uses match_pattern (stable key) instead of group id (which is a random UUID
-/// regenerated on every call to find_duplicates) so that the frontend can
-/// reliably reference groups across calls.
+/// Close all items in the matched duplicate groups.
+/// Groups are matched by id OR by match_pattern (stable key) so the frontend
+/// can reliably reference groups across recomputes.
+/// `keep_item_ids` explicitly lists items to keep; when absent, the first
+/// item of each (deterministically sorted) group is kept.
 /// Returns the count of successfully closed windows.
 #[tauri::command]
 pub async fn close_duplicates(
     group_ids: Vec<String>,
-    keep_indices: Option<Vec<usize>>,
+    keep_item_ids: Option<Vec<String>>,
 ) -> Result<usize, String> {
     // Recompute groups from live data
-    let all_groups = crate::duplicate::find_duplicates(
+    let all_groups = find_duplicates(
         &db::get_all_tracked_items().await.map_err(|e| e.to_string())?,
     );
 
+    let keeps: HashSet<String> = keep_item_ids.unwrap_or_default().into_iter().collect();
+    let keep_explicit = !keeps.is_empty();
     let mut closed = 0;
 
     for group in all_groups {
-        // Match by id OR by match_pattern — the id is a random UUID that
-        // changes on every find_duplicates() call, so we also accept
-        // match_pattern which is a stable key derived from URL/path/title.
         if group_ids.contains(&group.id) || group_ids.contains(&group.match_pattern) {
-            let keep_idx = keep_indices
-                .as_ref()
-                .and_then(|indices| indices.first().copied())
-                .unwrap_or(0);
-
             for (i, item) in group.items.iter().enumerate() {
-                if i != keep_idx {
-                    let did_close = if item.item_type == ItemType::BrowserTab {
-                        // Close browser tab via CDP
-                        cdp::close_cdp_tab(&item.id).await
-                    } else if let Some(hwnd) = item.window_handle {
-                        close_single_window(hwnd)
-                    } else {
-                        false
-                    };
+                let should_keep = if keep_explicit {
+                    keeps.contains(&item.id)
+                } else {
+                    i == 0
+                };
+                if should_keep {
+                    continue;
+                }
 
-                    // Delete from DB regardless — if window is gone, good;
-                    // if it's still there, the next scan will pick it up again
-                    let _ = db::delete_tracked_item(&item.id).await;
-                    if did_close {
-                        closed += 1;
-                    }
+                let did_close = if item.item_type == ItemType::BrowserTab {
+                    // Close browser tab via CDP
+                    cdp::close_cdp_tab(&item.id).await
+                } else if let Some(hwnd) = item.window_handle {
+                    close_single_window(hwnd)
+                } else {
+                    false
+                };
+
+                // Delete from DB regardless — if window is gone, good;
+                // if it's still there, the next scan will pick it up again
+                let _ = db::delete_tracked_item(&item.id).await;
+                if did_close {
+                    closed += 1;
                 }
             }
 
@@ -136,10 +206,9 @@ fn close_single_window(hwnd: i64) -> bool {
                 return true; // already gone
             }
 
-            // Simulate clicking the X button (most reliable)
-            let _ = SendMessageW(h, WM_SYSCOMMAND, WPARAM(0xF060), LPARAM(0)); // SC_CLOSE = 0xF060
-
-            true
+            // Simulate clicking the X button. PostMessage returns immediately
+            // even if the target window is hung (SendMessage would block).
+            PostMessageW(h, WM_SYSCOMMAND, WPARAM(0xF060), LPARAM(0)).is_ok() // SC_CLOSE = 0xF060
         }
     }
 

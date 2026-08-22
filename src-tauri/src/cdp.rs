@@ -2,7 +2,6 @@ use crate::platform::{ItemType, TrackedItem};
 use chrono::Utc;
 use serde::Deserialize;
 use std::time::Duration;
-use uuid::Uuid;
 
 /// CDP debug ports to scan
 const CDP_PORTS: [i32; 4] = [9222, 9223, 9224, 9225];
@@ -32,10 +31,21 @@ struct CdpTab {
     ws_url: Option<String>,
 }
 
+/// Response of /json/version — the `Browser` field tells the exact browser
+/// ("Edg/137.0.0.0", "Chrome/138.0.0.0", "OPR/…"), more reliable than
+/// guessing from open tabs.
+#[derive(Debug, Deserialize)]
+struct CdpVersion {
+    #[serde(default)]
+    browser: String,
+}
+
 /// Result of scanning a single CDP port
 struct CdpScanResult {
-    port: i32,
     tabs: Vec<CdpTab>,
+    /// Browser identifier from /json/version ("msedge" / "chrome" / …),
+    /// empty when the version endpoint did not respond.
+    browser: String,
 }
 
 /// Scan all CDP ports in parallel and return whichever responds.
@@ -45,13 +55,23 @@ async fn scan_cdp_ports() -> Vec<CdpScanResult> {
 
     for port in CDP_PORTS {
         let url = format!("http://127.0.0.1:{}/json", port);
+        let version_url = format!("http://127.0.0.1:{}/json/version", port);
         let client = client.clone();
         handles.push(tokio::spawn(async move {
             let resp = client.get(&url).send().await;
             match resp {
                 Ok(resp) => {
                     if let Ok(tabs) = resp.json::<Vec<CdpTab>>().await {
-                        Some(CdpScanResult { port, tabs })
+                        let browser = match client.get(&version_url).send().await {
+                            Ok(r) => r
+                                .json::<CdpVersion>()
+                                .await
+                                .ok()
+                                .map(|v| v.browser)
+                                .unwrap_or_default(),
+                            Err(_) => String::new(),
+                        };
+                        Some(CdpScanResult { tabs, browser })
                     } else {
                         None
                     }
@@ -91,15 +111,27 @@ pub async fn check_cdp_status() -> bool {
     false
 }
 
+/// Check whether a specific debug port answers and reports a browser.
+pub async fn is_debug_port_open(port: i32) -> bool {
+    cdp_client()
+        .get(format!("http://127.0.0.1:{}/json/version", port))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
 /// Scan CDP ports in parallel and fetch all open tabs from Chromium-based browsers.
 /// Returns tabs with real URLs.
 pub async fn fetch_browser_tabs() -> Vec<TrackedItem> {
     let scan_results = scan_cdp_ports().await;
+    // One timestamp for the whole scan so ordering stays deterministic
+    let now = Utc::now().to_rfc3339();
     let mut all_tabs = Vec::new();
 
     for result in scan_results {
-        let CdpScanResult { port, tabs } = result;
-        let browser = detect_browser(&tabs, port);
+        let CdpScanResult { tabs, browser } = result;
+        let browser = identify_browser(&browser, &tabs);
         for tab in tabs {
             // Skip non-page tabs (extensions, devtools, etc.)
             if tab.tab_type != "page" {
@@ -127,12 +159,41 @@ pub async fn fetch_browser_tabs() -> Vec<TrackedItem> {
                 window_handle: None, // tabs don't have window handles
                 item_type: ItemType::BrowserTab,
                 browser_name: Some(browser.to_string()),
-                last_active_at: Utc::now().to_rfc3339(),
+                last_active_at: now.clone(),
             });
         }
     }
 
     all_tabs
+}
+
+/// Map the /json/version "Browser" string to a process identifier.
+/// Falls back to tab-based heuristics when the version string is missing.
+fn identify_browser(version_browser: &str, tabs: &[CdpTab]) -> &'static str {
+    let v = version_browser.to_lowercase();
+    if v.contains("edg") {
+        return "msedge";
+    }
+    if v.contains("opr") {
+        return "opera";
+    }
+    if v.contains("vivaldi") {
+        return "vivaldi";
+    }
+    if v.contains("brave") {
+        return "brave";
+    }
+    if !v.is_empty() {
+        return "chrome";
+    }
+
+    // Fallback heuristics on tab URLs
+    for tab in tabs {
+        if tab.url.starts_with("edge://") || tab.url.starts_with("microsoft-edge://") {
+            return "msedge";
+        }
+    }
+    "chrome"
 }
 
 /// Close a browser tab via CDP.
@@ -190,21 +251,4 @@ pub async fn focus_cdp_tab(item_id: &str) -> bool {
         }
     }
     false
-}
-
-fn detect_browser(tabs: &[CdpTab], _port: i32) -> &'static str {
-    for tab in tabs {
-        let u = &tab.url;
-        if u.starts_with("edge://") || u.starts_with("microsoft-edge://") {
-            return "msedge";
-        }
-    }
-    // Look at user agent? For now, assume Chrome if it's a Chromium browser
-    // with no Edge-specific pages
-    for tab in tabs {
-        if tab.url.starts_with("chrome://") {
-            return "chrome";
-        }
-    }
-    "chrome" // default to Chrome
 }

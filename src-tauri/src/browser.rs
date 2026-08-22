@@ -13,6 +13,7 @@
 use crate::platform::TrackedItem;
 
 /// Start the WebSocket server for browser extension communication
+#[allow(dead_code)]
 pub fn start_extension_server() {
     // TODO: Implement WebSocket server using tokio-tungstenite
     // - Listen on 127.0.0.1:19876

@@ -8,16 +8,32 @@ mod actions;
 mod search;
 mod db;
 
+use tauri::{Emitter, Manager};
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
-            // Initialize database
+            // Initialize database under the OS app-data dir (%APPDATA%/<identifier>)
+            let data_dir = app.path().app_data_dir().ok();
             tauri::async_runtime::block_on(async {
-                db::init_db().await.expect("Failed to initialize database");
+                db::init_db(data_dir).await.expect("Failed to initialize database");
             });
+
+            // System-wide Ctrl+Shift+F toggles the search overlay.
+            // The webview listens for the "toggle-search" event. Registration
+            // failure (hotkey already taken) only logs — the UI keeps working.
+            use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+            if let Err(e) = app.global_shortcut().on_shortcut("ctrl+shift+f", |app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed {
+                    let _ = app.emit("toggle-search", ());
+                }
+            }) {
+                eprintln!("Failed to register global shortcut Ctrl+Shift+F: {}", e);
+            }
 
             Ok(())
         })

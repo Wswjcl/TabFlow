@@ -1,8 +1,10 @@
-use crate::platform::{DuplicateGroup, ItemType, Stats, Task, TrackedItem};
+use crate::platform::{ItemType, Stats, Task, TrackedItem};
 use chrono::Utc;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
@@ -11,19 +13,30 @@ async fn pool() -> &'static SqlitePool {
     DB_POOL.get().expect("Database not initialized")
 }
 
-/// Initialize the database and run migrations
-pub async fn init_db() -> Result<(), Box<dyn std::error::Error>> {
-    let db_dir = get_data_dir();
-    std::fs::create_dir_all(&db_dir).ok();
+/// Initialize the database and run migrations.
+/// `data_dir` should be the OS app-data dir (e.g. %APPDATA%/com.tabflow.app);
+/// when unavailable we fall back to the executable directory for dev runs.
+pub async fn init_db(data_dir: Option<std::path::PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let db_dir = data_dir.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    });
+    std::fs::create_dir_all(&db_dir)?;
     let db_path = db_dir.join("tabflow.db");
 
     let options = SqliteConnectOptions::new()
         .filename(&db_path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
 
+    // Single connection: SQLite allows one writer at a time, and a single
+    // connection serializes access without "database is locked" errors.
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(1)
         .connect_with(options)
         .await?;
 
@@ -50,11 +63,15 @@ pub async fn init_db() -> Result<(), Box<dyn std::error::Error>> {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- Assignments reference a stable resource key (normalized URL/path/
+        -- process+title), NOT a window instance: window rows come and go with
+        -- every scan, while the assignment should survive closing a window and
+        -- re-attach when the same resource is opened again.
         CREATE TABLE IF NOT EXISTS item_tasks (
-            item_id TEXT NOT NULL REFERENCES tracked_items(id) ON DELETE CASCADE,
+            resource_key TEXT NOT NULL,
             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
             assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (item_id, task_id)
+            PRIMARY KEY (resource_key, task_id)
         );
 
         CREATE TABLE IF NOT EXISTS duplicate_groups (
@@ -81,26 +98,6 @@ pub async fn init_db() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn get_data_dir() -> std::path::PathBuf {
-    // Use the executable's directory for the database
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            return exe_dir.to_path_buf();
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            let dir = std::path::PathBuf::from(appdata).join("TabFlow");
-            std::fs::create_dir_all(&dir).ok();
-            return dir;
-        }
-    }
-
-    std::path::PathBuf::from(".")
-}
-
 // ─── Helper: row → TrackedItem ───────────────────────────
 
 fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
@@ -117,19 +114,31 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
     }
 }
 
+const ITEM_COLUMNS: &str =
+    "id, title, url, path, process_name, window_handle, item_type, browser_name, last_active_at";
+
 // ─── Tracked Items ────────────────────────────────────────
 
+/// Order by last_active_at with a deterministic id tiebreaker so that
+/// repeated reads of the same data produce the same order (duplicate groups
+/// rely on this to keep "keep the first item" stable).
 pub async fn get_all_tracked_items() -> Result<Vec<TrackedItem>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT id, title, url, path, process_name, window_handle, item_type, browser_name, last_active_at FROM tracked_items ORDER BY last_active_at DESC"
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT {ITEM_COLUMNS} FROM tracked_items ORDER BY last_active_at DESC, id ASC"
+    ))
     .fetch_all(pool().await)
     .await?;
 
     Ok(rows.iter().map(|r| row_to_item(r)).collect())
 }
 
-pub async fn upsert_windows(items: &[TrackedItem]) -> Result<(), sqlx::Error> {
+/// Atomically bring tracked_items in sync with a fresh scan:
+/// upsert all live items and delete rows that are no longer open.
+/// Runs in a single transaction so concurrent readers never see a
+/// half-updated list.
+pub async fn sync_items(items: &[TrackedItem]) -> Result<(), sqlx::Error> {
+    let mut tx = pool().await.begin().await?;
+
     for item in items {
         sqlx::query(
             r#"
@@ -148,13 +157,31 @@ pub async fn upsert_windows(items: &[TrackedItem]) -> Result<(), sqlx::Error> {
         .bind(&item.path)
         .bind(&item.process_name)
         .bind(item.window_handle)
-        .bind(item.item_type.as_str())
+        .bind(&item.item_type.as_str())
         .bind(&item.browser_name)
         .bind(&item.last_active_at)
-        .execute(pool().await)
+        .execute(&mut *tx)
         .await?;
     }
-    Ok(())
+
+    if items.is_empty() {
+        sqlx::query("DELETE FROM tracked_items")
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        let placeholders: Vec<&str> = items.iter().map(|_| "?").collect();
+        let sql = format!(
+            "DELETE FROM tracked_items WHERE id NOT IN ({})",
+            placeholders.join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for id in items.iter().map(|i| &i.id) {
+            query = query.bind(id);
+        }
+        query.execute(&mut *tx).await?;
+    }
+
+    tx.commit().await
 }
 
 pub async fn delete_tracked_item(id: &str) -> Result<(), sqlx::Error> {
@@ -163,33 +190,6 @@ pub async fn delete_tracked_item(id: &str) -> Result<(), sqlx::Error> {
         .execute(pool().await)
         .await?;
     Ok(())
-}
-
-/// Remove items that are no longer open (stale)
-pub async fn cleanup_stale_items(current_ids: &[String]) -> Result<usize, sqlx::Error> {
-    if current_ids.is_empty() {
-        // No windows open → delete everything
-        let result = sqlx::query("DELETE FROM tracked_items")
-            .execute(pool().await)
-            .await?;
-        return Ok(result.rows_affected() as usize);
-    }
-
-    // Delete items whose IDs are NOT in the current live list
-    // Build dynamic query: DELETE FROM tracked_items WHERE id NOT IN (?, ?, ...)
-    let placeholders: Vec<String> = current_ids.iter().map(|_| "?".to_string()).collect();
-    let sql = format!(
-        "DELETE FROM tracked_items WHERE id NOT IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut query = sqlx::query(&sql);
-    for id in current_ids {
-        query = query.bind(id);
-    }
-
-    let result = query.execute(pool().await).await?;
-    Ok(result.rows_affected() as usize)
 }
 
 pub async fn touch_item(id: &str) -> Result<(), sqlx::Error> {
@@ -201,13 +201,27 @@ pub async fn touch_item(id: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+pub async fn get_tracked_item(id: &str) -> Result<Option<TrackedItem>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT {ITEM_COLUMNS} FROM tracked_items WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool().await)
+    .await?;
+
+    Ok(row.as_ref().map(|r| row_to_item(r)))
+}
+
 pub async fn search_items(query: &str) -> Result<Vec<TrackedItem>, sqlx::Error> {
     // Escape LIKE wildcards to treat them as literal characters
     let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("%{}%", escaped);
-    let rows = sqlx::query(
-        "SELECT id, title, url, path, process_name, window_handle, item_type, browser_name, last_active_at FROM tracked_items WHERE title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR process_name LIKE ? ESCAPE '\\' ORDER BY last_active_at DESC"
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT {ITEM_COLUMNS} FROM tracked_items \
+         WHERE title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' \
+         OR path LIKE ? ESCAPE '\\' OR process_name LIKE ? ESCAPE '\\' \
+         ORDER BY last_active_at DESC, id ASC"
+    ))
     .bind(&pattern)
     .bind(&pattern)
     .bind(&pattern)
@@ -220,31 +234,33 @@ pub async fn search_items(query: &str) -> Result<Vec<TrackedItem>, sqlx::Error> 
 
 // ─── Duplicate Groups ─────────────────────────────────────
 
-pub async fn detect_and_store_duplicates() -> Result<Vec<DuplicateGroup>, sqlx::Error> {
+/// duplicate_groups is derived data: mirror the current detection result
+/// (clear + reinsert in one transaction) instead of appending, so the table
+/// never accumulates stale rows and get_stats stays correct.
+pub async fn detect_and_store_duplicates() -> Result<(), sqlx::Error> {
     use crate::duplicate::find_duplicates;
 
-    let items = get_all_tracked_items().await?;
-    let groups = find_duplicates(&items);
+    let groups = find_duplicates(&get_all_tracked_items().await?);
+
+    let mut tx = pool().await.begin().await?;
+    sqlx::query("DELETE FROM duplicate_groups")
+        .execute(&mut *tx)
+        .await?;
 
     for group in &groups {
         sqlx::query(
-            "INSERT OR REPLACE INTO duplicate_groups (id, match_type, match_pattern, item_count, detected_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO duplicate_groups (id, match_type, match_pattern, item_count, detected_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&group.id)
         .bind(&group.match_type)
         .bind(&group.match_pattern)
         .bind(group.count as i32)
         .bind(Utc::now().to_rfc3339())
-        .execute(pool().await)
+        .execute(&mut *tx)
         .await?;
     }
 
-    Ok(groups)
-}
-
-pub async fn get_duplicate_groups() -> Result<Vec<DuplicateGroup>, sqlx::Error> {
-    let items = get_all_tracked_items().await?;
-    Ok(crate::duplicate::find_duplicates(&items))
+    tx.commit().await
 }
 
 pub async fn delete_duplicate_group(id: &str) -> Result<(), sqlx::Error> {
@@ -258,27 +274,38 @@ pub async fn delete_duplicate_group(id: &str) -> Result<(), sqlx::Error> {
 // ─── Tasks ────────────────────────────────────────────────
 
 pub async fn get_all_tasks() -> Result<Vec<Task>, sqlx::Error> {
-    let rows = sqlx::query(
-        r#"
-        SELECT t.id, t.name, t.color, t.sort_order,
-               COUNT(it.item_id) as item_count
-        FROM tasks t
-        LEFT JOIN item_tasks it ON t.id = it.task_id
-        GROUP BY t.id
-        ORDER BY t.sort_order ASC
-        "#,
-    )
-    .fetch_all(pool().await)
-    .await?;
+    let rows = sqlx::query("SELECT id, name, color, sort_order FROM tasks ORDER BY sort_order ASC")
+        .fetch_all(pool().await)
+        .await?;
+
+    let assigns: Vec<(String, String)> =
+        sqlx::query_as("SELECT task_id, resource_key FROM item_tasks")
+            .fetch_all(pool().await)
+            .await?;
+
+    // Count live items matching each task's resource keys
+    let mut live_counts: HashMap<String, i32> = HashMap::new();
+    for item in get_all_tracked_items().await? {
+        *live_counts
+            .entry(crate::duplicate::resource_key(&item))
+            .or_insert(0) += 1;
+    }
 
     Ok(rows
         .iter()
-        .map(|r| Task {
-            id: r.get("id"),
-            name: r.get("name"),
-            color: r.get("color"),
-            sort_order: r.get("sort_order"),
-            item_count: Some(r.get::<i64, _>("item_count") as i32),
+        .map(|r| {
+            let id: String = r.get("id");
+            let count = assigns
+                .iter()
+                .filter(|(tid, key)| tid == &id && live_counts.contains_key(key))
+                .count() as i32;
+            Task {
+                id,
+                name: r.get("name"),
+                color: r.get("color"),
+                sort_order: r.get("sort_order"),
+                item_count: Some(count),
+            }
         })
         .collect())
 }
@@ -294,9 +321,8 @@ pub async fn create_task(name: &str, color: &str) -> Result<Task, sqlx::Error> {
     .execute(pool().await)
     .await?;
 
-    // Read back the actual sort_order from DB instead of hardcoding 0
-    let row = sqlx::query_as::<_, (String, String, String, i32, i64)>(
-        "SELECT id, name, color, sort_order, 0 FROM tasks WHERE id = ?",
+    let row = sqlx::query_as::<_, (String, String, String, i32)>(
+        "SELECT id, name, color, sort_order FROM tasks WHERE id = ?",
     )
     .bind(&id)
     .fetch_one(pool().await)
@@ -329,9 +355,19 @@ pub async fn delete_task(id: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Resolve an item to its stable resource key. Fails when the window is
+/// already gone (row deleted by the scan).
+async fn resolve_resource_key(item_id: &str) -> Result<String, sqlx::Error> {
+    match get_tracked_item(item_id).await? {
+        Some(item) => Ok(crate::duplicate::resource_key(&item)),
+        None => Err(sqlx::Error::RowNotFound),
+    }
+}
+
 pub async fn assign_item_to_task(item_id: &str, task_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT OR IGNORE INTO item_tasks (item_id, task_id) VALUES (?, ?)")
-        .bind(item_id)
+    let resource_key = resolve_resource_key(item_id).await?;
+    sqlx::query("INSERT OR IGNORE INTO item_tasks (resource_key, task_id) VALUES (?, ?)")
+        .bind(&resource_key)
         .bind(task_id)
         .execute(pool().await)
         .await?;
@@ -339,30 +375,29 @@ pub async fn assign_item_to_task(item_id: &str, task_id: &str) -> Result<(), sql
 }
 
 pub async fn unassign_item_from_task(item_id: &str, task_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM item_tasks WHERE item_id = ? AND task_id = ?")
-        .bind(item_id)
+    let resource_key = resolve_resource_key(item_id).await?;
+    sqlx::query("DELETE FROM item_tasks WHERE resource_key = ? AND task_id = ?")
+        .bind(&resource_key)
         .bind(task_id)
         .execute(pool().await)
         .await?;
     Ok(())
 }
 
+/// Live tracked items currently matching a task's assigned resource keys.
 pub async fn get_task_items(task_id: &str) -> Result<Vec<TrackedItem>, sqlx::Error> {
-    let rows = sqlx::query(
-        r#"
-        SELECT ti.id, ti.title, ti.url, ti.path, ti.process_name,
-               ti.window_handle, ti.item_type, ti.browser_name, ti.last_active_at
-        FROM tracked_items ti
-        JOIN item_tasks it ON ti.id = it.item_id
-        WHERE it.task_id = ?
-        ORDER BY ti.last_active_at DESC
-        "#,
-    )
-    .bind(task_id)
-    .fetch_all(pool().await)
-    .await?;
+    let keys: Vec<(String,)> =
+        sqlx::query_as("SELECT resource_key FROM item_tasks WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_all(pool().await)
+            .await?;
+    let key_set: HashSet<String> = keys.into_iter().map(|(k,)| k).collect();
 
-    Ok(rows.iter().map(|r| row_to_item(r)).collect())
+    let items = get_all_tracked_items().await?;
+    Ok(items
+        .into_iter()
+        .filter(|i| key_set.contains(&crate::duplicate::resource_key(i)))
+        .collect())
 }
 
 // ─── Stats ────────────────────────────────────────────────

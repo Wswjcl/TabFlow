@@ -76,7 +76,7 @@ pub struct Stats {
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::enumerate_windows;
+pub use windows::{enumerate_windows, find_window_handle_by_process};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -86,4 +86,9 @@ pub use macos::enumerate_windows;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn enumerate_windows() -> Vec<TrackedItem> {
     vec![]
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn find_window_handle_by_process(_image_name: &str) -> Option<i64> {
+    None
 }

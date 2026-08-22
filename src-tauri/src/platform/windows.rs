@@ -3,28 +3,80 @@ use chrono::Utc;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::System::Threading::*;
 
 /// Enumerate all top-level windows on Windows
 pub fn enumerate_windows() -> Vec<TrackedItem> {
     let mut items = Vec::new();
-    let mut total = 0usize;
-    let mut skipped = 0usize;
-
     unsafe {
         let _ = EnumWindows(
             Some(enum_window_callback),
             LPARAM(&mut items as *mut Vec<TrackedItem> as isize),
         );
     }
-
-    // Filter out our own app's windows
-    let before = items.len();
-    items.retain(|item: &TrackedItem| {
-        !item.title.contains("TabFlow")
-    });
-    skipped += before - items.len();
-
     items
+}
+
+/// Find the handle of the first visible top-level window belonging to the
+/// given process image name (e.g. "msedge.exe"). Used to focus a browser's
+/// main window when CDP activation fails.
+pub fn find_window_handle_by_process(image_name: &str) -> Option<i64> {
+    struct FindState {
+        target: String,
+        found: Option<i64>,
+    }
+
+    unsafe extern "system" fn find_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut FindState);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return TRUE;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return TRUE;
+        }
+        if let Some(name) = process_image_name(pid) {
+            if name.to_lowercase() == state.target && state.found.is_none() {
+                state.found = Some(hwnd.0 as i64);
+                return FALSE; // stop enumeration
+            }
+        }
+        TRUE
+    }
+
+    let mut state = FindState {
+        target: image_name.to_lowercase(),
+        found: None,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_callback),
+            LPARAM(&mut state as *mut FindState as isize),
+        );
+    }
+    state.found
+}
+
+/// Real process image name (e.g. "chrome.exe") for a PID.
+fn process_image_name(pid: u32) -> Option<String> {
+    unsafe {
+        if pid == 0 {
+            return None;
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(process);
+        if ok.is_ok() && len > 0 {
+            let full = String::from_utf16_lossy(&buf[..len as usize]);
+            full.rsplit(['\\', '/']).next().map(|s| s.to_string())
+        } else {
+            None
+        }
+    }
 }
 
 unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -35,7 +87,14 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         return TRUE;
     }
 
-    // 2. Skip windows with no title
+    // 2. Skip our own process's windows (reliable regardless of title)
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == std::process::id() {
+        return TRUE;
+    }
+
+    // 3. Skip windows with no title
     let mut title_buf = [0u16; 512];
     let title_len = GetWindowTextW(hwnd, &mut title_buf);
     if title_len == 0 {
@@ -43,7 +102,7 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
     }
     let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
     let title = title.trim().to_string();
-    if title.is_empty() || title.len() < 1 {
+    if title.is_empty() {
         return TRUE;
     }
 
@@ -52,23 +111,17 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
     let class_len = GetClassNameW(hwnd, &mut class_buf);
     let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
 
-    // 5. Skip our own window
-    if title == "TabFlow" || class_name.contains("tabflow") {
-        return TRUE;
-    }
-
-    // 6. Skip tiny windows (tooltips, icons, etc.)
+    // 5. Skip tiny windows (tooltips, icons, etc.)
     let mut rect = RECT::default();
     if GetWindowRect(hwnd, &mut rect).is_ok() {
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
-        // Only skip extremely small or invisible windows
         if width <= 0 || height <= 0 {
             return TRUE;
         }
     }
 
-    // 7. Skip known noise / system windows
+    // 6. Skip known noise / system windows
     let skip_classes = [
         "Windows.UI.Core.CoreWindow",
         "ApplicationFrameWindow",
@@ -98,22 +151,25 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         return TRUE;
     }
 
-    // 9. Determine process name & classify
-    let process_name = infer_process_name(&title, &class_name);
+    // 7. Real process name from the PID (falls back to the window class)
+    let process_name = process_image_name(pid).unwrap_or_else(|| format!("app:{}", class_name));
 
-    // Skip known background processes (very specific)
+    // Skip known background noise processes
     let skip_processes = [
         "nvidia",
         "nvcontainer",
         "cef-osc",
         "pcm_h5",
     ];
-    if skip_processes.iter().any(|p| process_name.to_lowercase().contains(p)) {
+    if skip_processes
+        .iter()
+        .any(|p| process_name.to_lowercase().contains(p))
+    {
         return TRUE;
     }
 
-    // 10. Classify window type
-    let (item_type, browser_name, url) = classify_window(&title, &process_name, &class_name);
+    // 8. Classify window type
+    let (item_type, browser_name, url) = classify_window(&title, &process_name);
 
     // Skip browser main windows — their individual tabs are captured via CDP.
     // Showing the main window here would create duplicates (same title appears
@@ -146,66 +202,13 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
     TRUE
 }
 
-fn infer_process_name(title: &str, class_name: &str) -> String {
-    let title_lower = title.to_lowercase();
-    let class_lower = class_name.to_lowercase();
-
-    // Normalize title for matching (remove invisible chars)
-    let title_normalized: String = title_lower
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ' || *c == '\n')
-        .collect();
-
-    if class_lower.contains("chrome_widgetwin") {
-        // Check for Edge first (it's also a Chromium widget)
-        if title_normalized.contains("microsoft edge") || title_normalized.contains("microsoftedge") {
-            return "msedge.exe".to_string();
-        }
-        if title_normalized.contains("google chrome") || title_normalized.ends_with("google chrome") {
-            return "chrome.exe".to_string();
-        }
-        return "chromium_host".to_string();
-    }
-
-    if class_lower.contains("mozilla") || title_lower.contains("mozilla firefox") {
-        return "firefox.exe".to_string();
-    }
-
-    if class_name == "CabinetWClass" || class_name == "ExploreWClass" {
-        return "explorer.exe".to_string();
-    }
-
-    // Known app classes
-    if class_lower.contains("vscode") || class_lower.contains("code") {
-        return "code.exe".to_string();
-    }
-    if class_lower.contains("notepad") {
-        return "notepad.exe".to_string();
-    }
-    if class_lower.contains("sunawin") || class_lower.contains("sunaframe") {
-        return "sunlogin.exe".to_string();
-    }
-    if class_lower.contains("wechat") || class_lower.contains("wechatmainwnd") {
-        return "wechat.exe".to_string();
-    }
-    if class_lower.contains("qq") || title_lower.contains("qq") {
-        return "qq.exe".to_string();
-    }
-    if class_lower.contains("afx:") || class_lower.contains("afxframe") {
-        return "mfc_app.exe".to_string();
-    }
-
-    format!("app:{}", class_name)
-}
-
 fn classify_window(
     title: &str,
     process_name: &str,
-    _class_name: &str,
 ) -> (ItemType, Option<String>, Option<String>) {
     let process_lower = process_name.to_lowercase();
 
-    // Known browsers
+    // Known browsers (real image names)
     if process_lower == "chrome.exe" {
         let url = extract_url_from_title(title, "chrome");
         return (ItemType::BrowserTab, Some("chrome".into()), url);

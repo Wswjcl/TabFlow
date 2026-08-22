@@ -1,10 +1,17 @@
 use crate::platform::{self, TrackedItem, ItemType};
 use crate::db;
 use crate::cdp;
+use tokio::sync::Mutex;
+
+/// Serializes scans: two overlapping get_tracked_items calls (manual refresh
+/// racing a programmatic one) must not interleave their DB sync.
+static SCAN_MUTEX: Mutex<()> = Mutex::const_new(());
 
 /// Get current tracked items from DB (scans live windows + CDP tabs, cleans stale)
 #[tauri::command]
 pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
+    let _guard = SCAN_MUTEX.lock().await;
+
     // 1. Scan browser tabs via CDP (real URLs, all tabs)
     let cdp_tabs = cdp::fetch_browser_tabs().await;
 
@@ -36,13 +43,10 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
         all_items.extend(window_items);
     }
 
-    // 4. Store & cleanup
-    if let Err(e) = db::upsert_windows(&all_items).await {
-        eprintln!("Failed to upsert: {}", e);
+    // 4. Atomically store & clean up stale rows
+    if let Err(e) = db::sync_items(&all_items).await {
+        eprintln!("Failed to sync items: {}", e);
     }
-
-    let ids: Vec<String> = all_items.iter().map(|i| i.id.clone()).collect();
-    let _ = db::cleanup_stale_items(&ids).await;
 
     // 5. Return from DB
     db::get_all_tracked_items()
