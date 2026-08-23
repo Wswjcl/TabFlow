@@ -45,7 +45,7 @@ export function ItemCard({ item }: ItemCardProps) {
     ?.replace(/^title:/, "")
     ?.slice(0, 60);
 
-  const icon =
+  const fallbackIcon =
     item.item_type === "browser_tab"
       ? browserIcon(item.browser_name)
       : itemTypeIcon(item.item_type);
@@ -62,8 +62,17 @@ export function ItemCard({ item }: ItemCardProps) {
       onContextMenu={handleContextMenu}
       title="单击跳转 · 右键追踪到 Task"
     >
-      {/* Icon */}
-      <span className="text-sm shrink-0">{icon}</span>
+      {/* Icon: the app's real icon extracted from its exe, emoji as fallback */}
+      {item.icon ? (
+        <img
+          src={item.icon}
+          alt=""
+          draggable={false}
+          className="w-4 h-4 shrink-0 object-contain"
+        />
+      ) : (
+        <span className="text-sm shrink-0">{fallbackIcon}</span>
+      )}
 
       {/* Content */}
       <div className="flex-1 min-w-0">

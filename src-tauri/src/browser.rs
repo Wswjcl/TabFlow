@@ -341,6 +341,7 @@ pub async fn get_extension_tabs() -> Vec<TrackedItem> {
                 item_type: ItemType::BrowserTab,
                 browser_name: Some(browser.clone()),
                 last_active_at: now.clone(),
+                icon: None,
                 task_ids: Vec::new(),
             });
         }

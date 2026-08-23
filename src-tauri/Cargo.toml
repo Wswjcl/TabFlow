@@ -37,7 +37,12 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
 ] }
+png = "0.17"
+base64 = "0.22"
 
 [features]
 default = ["custom-protocol"]

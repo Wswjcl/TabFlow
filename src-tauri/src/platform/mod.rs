@@ -12,6 +12,10 @@ pub struct TrackedItem {
     pub item_type: ItemType,
     pub browser_name: Option<String>,
     pub last_active_at: String,
+    /// Real app icon as a PNG data URL (extracted from the process exe,
+    /// attached when rows leave the DB; not persisted). None → emoji fallback.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// Tasks this item's resource is assigned to (filled by db queries)
     pub task_ids: Vec<String>,
 }
@@ -86,6 +90,17 @@ mod explorer;
 pub use explorer::{
     can_close_explorer_window, close_explorer_tab, enumerate_explorer_items,
 };
+
+#[cfg(target_os = "windows")]
+mod icons;
+#[cfg(target_os = "windows")]
+pub use icons::process_icon;
+
+#[cfg(not(target_os = "windows"))]
+/// Icon extraction is Windows-only; other platforms use the emoji fallback.
+pub fn process_icon(_process_name: &str) -> Option<String> {
+    None
+}
 
 #[cfg(not(target_os = "windows"))]
 /// COM enumeration unavailable outside Windows → Err triggers the

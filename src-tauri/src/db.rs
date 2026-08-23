@@ -111,6 +111,7 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
         item_type: ItemType::from_str(row.get::<String, _>("item_type").as_str()),
         browser_name: row.get("browser_name"),
         last_active_at: row.get("last_active_at"),
+        icon: None,
         task_ids: Vec::new(),
     }
 }
@@ -137,6 +138,19 @@ async fn attach_task_ids(items: &mut Vec<TrackedItem>) {
     }
 }
 
+/// Post-process DB rows into fully-populated items: task assignments and
+/// real app icons (icons aren't persisted — they come from the in-memory
+/// per-process cache, so every consumer gets them).
+async fn hydrate_items(mut items: Vec<TrackedItem>) -> Vec<TrackedItem> {
+    attach_task_ids(&mut items).await;
+    for item in items.iter_mut() {
+        if item.icon.is_none() {
+            item.icon = crate::platform::process_icon(&item.process_name);
+        }
+    }
+    items
+}
+
 const ITEM_COLUMNS: &str =
     "id, title, url, path, process_name, window_handle, item_type, browser_name, last_active_at";
 
@@ -152,9 +166,8 @@ pub async fn get_all_tracked_items() -> Result<Vec<TrackedItem>, sqlx::Error> {
     .fetch_all(pool().await)
     .await?;
 
-    let mut items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
-    attach_task_ids(&mut items).await;
-    Ok(items)
+    let items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
+    Ok(hydrate_items(items).await)
 }
 
 /// Atomically bring tracked_items in sync with a fresh scan:
@@ -254,9 +267,8 @@ pub async fn search_items(query: &str) -> Result<Vec<TrackedItem>, sqlx::Error> 
     .fetch_all(pool().await)
     .await?;
 
-    let mut items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
-    attach_task_ids(&mut items).await;
-    Ok(items)
+    let items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
+    Ok(hydrate_items(items).await)
 }
 
 // ─── Duplicate Groups ─────────────────────────────────────

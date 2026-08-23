@@ -4255,8 +4255,10 @@ dependencies = [
 name = "tabflow"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "futures-util",
+ "png 0.17.16",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

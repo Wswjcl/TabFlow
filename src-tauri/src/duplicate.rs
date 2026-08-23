@@ -247,6 +247,7 @@ mod tests {
             item_type: ItemType::BrowserTab,
             browser_name: Some(browser.to_string()),
             last_active_at: Utc::now().to_rfc3339(),
+            icon: None,
             task_ids: Vec::new(),
         }
     }

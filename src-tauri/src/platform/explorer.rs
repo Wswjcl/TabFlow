@@ -130,6 +130,7 @@ unsafe fn enumerate_via_shell_windows() -> Result<Vec<TrackedItem>, ()> {
             item_type: ItemType::ExplorerWindow,
             browser_name: None,
             last_active_at: now.clone(),
+            icon: None,
             task_ids: Vec::new(),
         });
     }
