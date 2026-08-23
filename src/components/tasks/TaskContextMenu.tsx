@@ -40,17 +40,26 @@ export function TaskContextMenu({ x, y, item, onClose }: Props) {
 
   return (
     <>
+      {/* Click-catcher: closes the menu. stopPropagation is essential —
+          without it every click bubbles into the parent ItemCard's
+          onClick and focuses/jumps to the tracked window. */}
       <div
         className="fixed inset-0 z-40"
-        onClick={onClose}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
+          e.stopPropagation();
           onClose();
         }}
       />
       <div
         className="fixed z-50 min-w-[180px] bg-popover border rounded-md shadow-xl py-1 text-sm"
         style={{ left, top: Math.max(8, top) }}
+        onClick={(e) => e.stopPropagation()}
+        onContextMenu={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold text-muted-foreground/60 uppercase tracking-wider">
           <FolderKanban className="w-3 h-3" />
