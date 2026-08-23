@@ -5,10 +5,11 @@
 //! Unlike CDP this works on normally-running browsers — no debug flag, no
 //! restart — and supports any Chromium browser plus Firefox.
 //!
-//! Pairing: the desktop app generates a random token (see
-//! [`pairing_token`]); the user pastes it once into the extension popup.
-//! Connections with a wrong token are dropped, so stray local processes
-//! can't inject fake tab data.
+//! Pairing: the app uses a pairing token (see [`load_or_create_token`]) that
+//! is generated once and persisted in the app-data dir, so the user pastes
+//! it into the extension popup exactly once — paired browsers reconnect
+//! automatically after app restarts. Connections with a wrong token are
+//! dropped, so stray local processes can't inject fake tab data.
 //!
 //! MV3 service workers are recycled routinely (tens of seconds to minutes);
 //! that drops the socket without closing any tabs. A dead connection's last
@@ -80,12 +81,46 @@ struct Hub {
 }
 
 static HUB: OnceLock<Hub> = OnceLock::new();
+static TOKEN: OnceLock<String> = OnceLock::new();
 
 fn hub() -> &'static Hub {
     HUB.get_or_init(|| Hub {
-        token: uuid::Uuid::new_v4().simple().to_string(),
+        token: token().to_string(),
         conns: Mutex::new(HashMap::new()),
     })
+}
+
+/// The pairing token: the persisted one when setup loaded it, otherwise a
+/// fresh per-run one (setup always runs before the server accepts sockets,
+/// so in practice the persisted value is what's used).
+fn token() -> &'static str {
+    TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// Install the persisted pairing token. Must be called from setup, before
+/// any connection can reach the hub.
+pub fn init_token(persisted: String) {
+    if TOKEN.set(persisted).is_err() {
+        eprintln!("Extension token already initialized; ignoring re-init");
+    }
+}
+
+/// Read the pairing token from `<dir>/extension-token.txt`, or generate and
+/// persist a new one. The token survives app restarts so paired browsers
+/// reconnect without the user re-pasting it.
+pub fn load_or_create_token(dir: &std::path::Path) -> std::io::Result<String> {
+    let file = dir.join("extension-token.txt");
+    if let Ok(stored) = std::fs::read_to_string(&file) {
+        let stored = stored.trim();
+        if stored.len() == 32 && stored.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(stored.to_string());
+        }
+        eprintln!("Extension token file invalid; regenerating");
+    }
+    let fresh = uuid::Uuid::new_v4().simple().to_string();
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&file, &fresh)?;
+    Ok(fresh)
 }
 
 /// Bind and serve the extension WebSocket. Returns immediately; the server
@@ -537,5 +572,21 @@ mod tests {
         assert_eq!(canonical_ext_id("edge"), "edge");
         assert_eq!(canonical_ext_id("chrome"), "chrome");
         assert_eq!(canonical_ext_id("opera"), "opera");
+    }
+
+    #[test]
+    fn token_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("tabflow-token-test-{}", uuid::Uuid::new_v4()));
+        let first = load_or_create_token(&dir).expect("creates token file");
+        assert_eq!(first.len(), 32);
+        let second = load_or_create_token(&dir).expect("reads token file back");
+        assert_eq!(first, second, "restart must reuse the stored token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_token_is_used_by_the_hub() {
+        init_token("0123456789abcdef0123456789abcdef".to_string());
+        assert_eq!(hub().token, "0123456789abcdef0123456789abcdef");
     }
 }

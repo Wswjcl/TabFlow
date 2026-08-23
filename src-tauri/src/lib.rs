@@ -20,8 +20,22 @@ pub fn run() {
             // Initialize database under the OS app-data dir (%APPDATA%/<identifier>)
             let data_dir = app.path().app_data_dir().ok();
             tauri::async_runtime::block_on(async {
-                db::init_db(data_dir).await.expect("Failed to initialize database");
+                db::init_db(data_dir.clone()).await.expect("Failed to initialize database");
             });
+
+            // Pairing token lives next to the DB: generated once, reused on
+            // every launch so paired extensions reconnect automatically.
+            // On any IO failure we fall back to a per-run token (repair by
+            // pasting the token once again).
+            if let Some(dir) = &data_dir {
+                match browser::load_or_create_token(dir) {
+                    Ok(token) => browser::init_token(token),
+                    Err(e) => eprintln!(
+                        "Extension token: could not load/create ({e}); \
+                         extensions must re-pair this run"
+                    ),
+                }
+            }
 
             // WebSocket server for the browser extension (tab-level data
             // from normally-running browsers; no debug flag needed)
