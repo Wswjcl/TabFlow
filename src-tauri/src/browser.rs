@@ -320,7 +320,11 @@ pub async fn get_extension_tabs() -> Vec<TrackedItem> {
 
     for (browser, conn) in conns.iter() {
         for tab in &conn.tabs {
-            if is_internal_url(&tab.url) {
+            // Skip only URL-less tabs: every open tab counts (new-tab and
+            // settings pages included — they are prime duplicate fodder),
+            // but an empty URL has no stable identity and would make all
+            // such tabs look like duplicates of each other.
+            if tab.url.is_empty() {
                 continue;
             }
             items.push(TrackedItem {
@@ -435,16 +439,6 @@ pub fn canonical_ext_id(name: &str) -> &str {
     }
 }
 
-fn is_internal_url(url: &str) -> bool {
-    url.is_empty()
-        || url == "about:blank"
-        || url.starts_with("chrome://")
-        || url.starts_with("edge://")
-        || url.starts_with("about:")
-        || url.starts_with("chrome-extension://")
-        || url.starts_with("moz-extension://")
-}
-
 /// Status for the pairing UI.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -473,11 +467,7 @@ pub async fn get_extension_status() -> ExtensionStatus {
                 browser: browser.clone(),
                 // Same filter as get_extension_tabs, so the indicator count
                 // always matches the number of list items.
-                tab_count: conn
-                    .tabs
-                    .iter()
-                    .filter(|t| !is_internal_url(&t.url))
-                    .count(),
+                tab_count: conn.tabs.iter().filter(|t| !t.url.is_empty()).count(),
             })
             .collect(),
     }
@@ -498,14 +488,6 @@ mod tests {
         assert_eq!(parse_ext_id("ext_chrome_"), None);
         assert_eq!(parse_ext_id("ext__7"), None); // empty browser
         assert_eq!(parse_ext_id("ext_chrome_abc"), None);
-    }
-
-    #[test]
-    fn filters_internal_urls() {
-        assert!(is_internal_url("chrome://settings"));
-        assert!(is_internal_url("edge://newtab"));
-        assert!(is_internal_url(""));
-        assert!(!is_internal_url("https://example.com"));
     }
 
     /// The extension sends camelCase keys (tabId/windowId) — make sure the

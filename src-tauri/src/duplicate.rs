@@ -230,3 +230,44 @@ fn close_single_window(hwnd: i64) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn ext_tab(id: &str, url: &str, browser: &str) -> TrackedItem {
+        TrackedItem {
+            id: id.to_string(),
+            title: "新标签页".to_string(),
+            url: Some(url.to_string()),
+            path: None,
+            process_name: format!("{}.exe", browser),
+            window_handle: None,
+            item_type: ItemType::BrowserTab,
+            browser_name: Some(browser.to_string()),
+            last_active_at: Utc::now().to_rfc3339(),
+            task_ids: Vec::new(),
+        }
+    }
+
+    /// Internal pages are tracked tabs now: several open new-tab pages must
+    /// group as duplicates (they are the most common tab clutter), while a
+    /// browser's own new-tab scheme stays distinct from another's.
+    #[test]
+    fn new_tab_pages_group_as_duplicates() {
+        let items = vec![
+            ext_tab("ext_chrome_1", "https://example.com", "chrome"),
+            ext_tab("ext_chrome_2", "chrome://newtab/", "chrome"),
+            ext_tab("ext_chrome_3", "chrome://newtab/", "chrome"),
+            ext_tab("ext_edge_7", "edge://newtab/", "edge"),
+        ];
+        let groups = find_duplicates(&items);
+        // Only the two chrome://newtab tabs form a group; singletons
+        // (example.com, the one edge://newtab) are not groups, and each
+        // browser's new-tab scheme keeps its own key.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].match_pattern, "url:chrome://newtab");
+        assert_eq!(groups[0].count, 2);
+    }
+}

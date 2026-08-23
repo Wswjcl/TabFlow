@@ -137,16 +137,9 @@ pub async fn fetch_browser_tabs() -> Vec<TrackedItem> {
             if tab.tab_type != "page" {
                 continue;
             }
-            // Skip chrome:// and edge:// internal pages
-            if tab.url.starts_with("chrome://")
-                || tab.url.starts_with("edge://")
-                || tab.url.starts_with("about:")
-                || tab.url.starts_with("chrome-extension://")
-            {
-                continue;
-            }
-            // Skip empty/new tab pages
-            if tab.url.is_empty() || tab.url == "about:blank" {
+            // Skip only URL-less tabs: internal pages (new-tab, settings)
+            // are real tabs and count, same as on the extension channel.
+            if tab.url.is_empty() {
                 continue;
             }
 
