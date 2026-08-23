@@ -7,8 +7,6 @@
 //! gives the real folder path. Tabs of one window share a single HWND.
 //!
 //! Limitations (documented trade-offs):
-//! - Two tabs showing the same folder in the SAME window collapse into one
-//!   item (the collection exposes no stable per-tab id).
 //! - Virtual folders (This PC, Recycle Bin) have no file:// URL; they are
 //!   kept with path = None and don't participate in duplicate detection.
 //! - Closing a single tab is only safe when its window has no sibling tabs
@@ -17,6 +15,7 @@
 
 use super::{ItemType, TrackedItem};
 use chrono::Utc;
+use std::collections::HashMap;
 use windows::core::{GUID, Interface, VARIANT};
 use windows::Win32::Foundation::{HWND, SHANDLE_PTR};
 use windows::Win32::System::Com::*;
@@ -54,6 +53,12 @@ unsafe fn enumerate_via_shell_windows() -> Result<Vec<TrackedItem>, ()> {
     let count = shell_windows.Count().map_err(|_| ())?;
     let now = Utc::now().to_rfc3339();
     let mut items = Vec::new();
+    // Occurrence counter per (window, folder): IShellWindows exposes no
+    // stable per-tab id, so the 2nd+ tab showing the same folder in the
+    // same window gets a "_n" suffix. The occurrences are interchangeable
+    // (same path/title/hwnd); when one closes, the highest suffix simply
+    // disappears on the next scan.
+    let mut occurrences: HashMap<(i64, String), usize> = HashMap::new();
 
     for i in 0..count {
         let variant = VARIANT::from(i);
@@ -90,16 +95,23 @@ unsafe fn enumerate_via_shell_windows() -> Result<Vec<TrackedItem>, ()> {
             continue;
         }
 
-        // Identity per (window, folder). Stable across scans so DB upserts
-        // and task assignments (resource_key = path) survive re-scans.
+        // Identity per (window, folder), with an occurrence suffix for
+        // same-folder tabs in the same window. Stable across scans so DB
+        // upserts and task assignments (resource_key = path) survive
+        // re-scans, and two tabs with the same folder stay two items.
         let identity = path
             .as_deref()
             .unwrap_or(&title)
             .to_lowercase()
             .replace('\\', "/");
+        let occurrence = occurrences
+            .entry((hwnd, identity.clone()))
+            .or_insert(0);
+        let id = explorer_item_id(hwnd, &identity, *occurrence);
+        *occurrence += 1;
 
         items.push(TrackedItem {
-            id: format!("explorer_{}_{}", hwnd, identity),
+            id,
             title: if title.is_empty() {
                 path.clone().unwrap_or_default()
             } else {
@@ -118,6 +130,17 @@ unsafe fn enumerate_via_shell_windows() -> Result<Vec<TrackedItem>, ()> {
     // Deterministic order (duplicate grouping keeps first-item semantics)
     items.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(items)
+}
+
+/// Item id for an Explorer tab. Occurrence 0 keeps the plain form (stable
+/// for the common single-tab case and backward compatible with existing
+/// rows); 2nd+ tabs of the same folder in the same window get "_n".
+fn explorer_item_id(hwnd: i64, identity: &str, occurrence: usize) -> String {
+    if occurrence == 0 {
+        format!("explorer_{}_{}", hwnd, identity)
+    } else {
+        format!("explorer_{}_{}_{}", hwnd, identity, occurrence)
+    }
 }
 
 /// True when `hwnd` is a classic Explorer window (not the desktop or IE).
@@ -209,6 +232,29 @@ mod tests {
         assert_eq!(percent_decode(b"%zz"), None); // invalid hex
         assert_eq!(percent_decode(b"plain"), Some(b"plain".to_vec()));
         assert_eq!(percent_decode(b"a%20b"), Some(b"a b".to_vec()));
+    }
+
+    #[test]
+    fn same_folder_tabs_get_distinct_ids() {
+        // 1st occurrence: plain form (stable, backward compatible)
+        assert_eq!(
+            explorer_item_id(100, "c:/users/foo", 0),
+            "explorer_100_c:/users/foo"
+        );
+        // 2nd/3rd tab of the same folder in the same window: suffixed
+        assert_eq!(
+            explorer_item_id(100, "c:/users/foo", 1),
+            "explorer_100_c:/users/foo_1"
+        );
+        assert_eq!(
+            explorer_item_id(100, "c:/users/foo", 2),
+            "explorer_100_c:/users/foo_2"
+        );
+        // Same folder in a different window: different hwnd → distinct anyway
+        assert_ne!(
+            explorer_item_id(100, "c:/users/foo", 0),
+            explorer_item_id(200, "c:/users/foo", 0)
+        );
     }
 
     /// Manual smoke test against the live system:
