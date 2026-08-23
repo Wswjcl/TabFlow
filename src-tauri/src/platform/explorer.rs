@@ -18,12 +18,15 @@ use super::{ItemType, TrackedItem};
 use chrono::Utc;
 use std::collections::HashMap;
 use windows::core::{GUID, Interface, VARIANT};
-use windows::Win32::Foundation::{HWND, LPARAM, SHANDLE_PTR, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, SHANDLE_PTR, TRUE, WPARAM};
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::Accessibility::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
+use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC, VK_CONTROL};
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2};
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, PostMessageW, WM_KEYDOWN, WM_KEYUP};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, PostMessageW, SystemParametersInfoW, EnumChildWindows, WM_KEYDOWN, WM_KEYUP,
+    OBJID_CLIENT, SPIF_UPDATEINIFILE, SPI_GETSCREENREADER, SPI_SETSCREENREADER,
+};
 
 /// CLSID of the ShellWindows coclass (not exposed by the windows crate).
 const CLSID_SHELL_WINDOWS: GUID = GUID::from_u128(0x9BA05972_F6A8_11CF_A442_00A0C90A8F39);
@@ -127,6 +130,7 @@ unsafe fn enumerate_via_shell_windows() -> Result<Vec<TrackedItem>, ()> {
             item_type: ItemType::ExplorerWindow,
             browser_name: None,
             last_active_at: now.clone(),
+            task_ids: Vec::new(),
         });
     }
 
@@ -167,11 +171,11 @@ pub fn can_close_explorer_window(hwnd: i64, items: &[TrackedItem]) -> bool {
         <= 1
 }
 
-/// Close a single Explorer tab in a multi-tab window via UI Automation:
-/// select the TabItem whose name matches `tab_title`, then post Ctrl+W
-/// (closes exactly the active tab). Falls back to false when the tab strip
-/// isn't reachable — callers should then leave the tab alone.
-///
+/// Close a single Explorer tab in a multi-tab window via UI Automation.
+/// Chain (first that works wins):
+///   1. invoke the TabItem's own close button — most precise, no keyboard,
+///      no focus changes, locale-independent
+///   2. select the tab, then post Ctrl+W with proper scan codes
 /// Same-folder tabs are interchangeable, so closing "a tab named X" is
 /// equivalent to closing any specific one of them.
 pub fn close_explorer_tab(hwnd: i64, tab_title: &str) -> bool {
@@ -190,53 +194,336 @@ pub fn close_explorer_tab(hwnd: i64, tab_title: &str) -> bool {
     .unwrap_or(false)
 }
 
-unsafe fn uia_close_tab(hwnd: i64, tab_title: &str) -> bool {
-    let automation: IUIAutomation =
-        match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-    let root = match automation.ElementFromHandle(HWND(hwnd as *mut _)) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
+unsafe fn uia_automation() -> Option<IUIAutomation> {
+    CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
+}
 
-    // TabItem with matching display name in this window's tab strip
-    let name_cond = automation.CreatePropertyCondition(
-        UIA_NamePropertyId,
-        &VARIANT::from(tab_title),
+/// Nudge Explorer into building its full accessibility tree. Without an
+/// assistive-technology client present, the Win11 content area (including
+/// the tab strip) is simply not exposed over UIA — the tree only contains
+/// the title bar.
+///
+/// 1. An OBJID_CLIENT request (WM_GETOBJECT) triggers provider creation in
+///    Chromium-family UI frameworks.
+/// 2. The system "screen reader" flag makes apps keep the tree alive.
+///    Returns true when WE flipped the flag (caller must restore it after).
+unsafe fn activate_accessibility(hwnd: i64) -> bool {
+    // OBJID_CLIENT request
+    let mut acc: *mut core::ffi::c_void = std::ptr::null_mut();
+    let riid = &<IAccessible as Interface>::IID;
+    let _ = AccessibleObjectFromWindow(
+        HWND(hwnd as *mut _),
+        OBJID_CLIENT.0 as u32,
+        riid,
+        &mut acc as *mut *mut core::ffi::c_void,
     );
-    let type_cond = automation.CreatePropertyCondition(
+    if !acc.is_null() {
+        // We own the returned reference — release it.
+        let accessible: IAccessible = std::mem::transmute(acc);
+        drop(accessible);
+    }
+
+    // Screen-reader flag (restore later if we changed it)
+    let mut prev: u32 = 0;
+    let _ = SystemParametersInfoW(
+        SPI_GETSCREENREADER,
+        0,
+        Some(&mut prev as *mut u32 as *mut core::ffi::c_void),
+        Default::default(),
+    );
+    if prev == 0 {
+        let _ = SystemParametersInfoW(SPI_SETSCREENREADER, 1, None, SPIF_UPDATEINIFILE);
+        true
+    } else {
+        false
+    }
+}
+
+unsafe fn restore_screen_reader_flag() {
+    let _ = SystemParametersInfoW(SPI_SETSCREENREADER, 0, None, SPIF_UPDATEINIFILE);
+}
+
+/// All descendant HWND ids of a window (the tab strip lives in XAML-island
+/// child HWNDs that may not be bridged into the parent's UIA tree).
+fn child_hwnds(hwnd: i64) -> Vec<i64> {
+    struct Ctx {
+        out: Vec<i64>,
+    }
+    unsafe extern "system" fn callback(h: HWND, l: LPARAM) -> BOOL {
+        let ctx = &mut *(l.0 as *mut Ctx);
+        ctx.out.push(h.0 as i64);
+        TRUE
+    }
+    let mut ctx = Ctx { out: Vec::new() };
+    unsafe {
+        let _ = EnumChildWindows(HWND(hwnd as *mut _), Some(callback), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.out
+}
+
+/// Find ALL TabItem elements of a window: searches the top-level element
+/// plus every descendant HWND (XAML islands are separate HWNDs), after
+/// activating the accessibility tree. The same tab can appear in several
+/// subtree bridges — callers must treat the list as containing duplicates.
+unsafe fn find_all_tab_items(
+    automation: &IUIAutomation,
+    hwnd: i64,
+) -> Vec<IUIAutomationElement> {
+    let Ok(type_cond) = automation.CreatePropertyCondition(
         UIA_ControlTypePropertyId,
         &VARIANT::from(UIA_TabItemControlTypeId.0 as i32),
-    );
-    let (name_cond, type_cond) = match (name_cond, type_cond) {
-        (Ok(n), Ok(t)) => (n, t),
-        _ => return false,
-    };
-    let cond = match automation.CreateAndCondition(&name_cond, &type_cond) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let tab = match root.FindFirst(TreeScope_Subtree, &cond) {
-        Ok(t) => t, // a null/no-match result fails below on pattern lookup
-        Err(_) => return false,
+    ) else {
+        return Vec::new();
     };
 
-    // Activate the tab…
-    let selection: IUIAutomationSelectionItemPattern =
-        match tab.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
-        {
-            Ok(p) => p,
-            Err(_) => return false,
+    let mut result: Vec<IUIAutomationElement> = Vec::new();
+    for h in std::iter::once(hwnd).chain(child_hwnds(hwnd)) {
+        let Ok(root) = automation.ElementFromHandle(HWND(h as *mut _)) else {
+            continue;
         };
-    if selection.Select().is_err() {
-        return false;
+        let Ok(found) = root.FindAll(TreeScope_Subtree, &type_cond) else {
+            continue;
+        };
+        let Ok(len) = found.Length() else { continue };
+        for i in 0..len {
+            let Ok(el) = found.GetElement(i) else { continue };
+            // drop elements that are bridges to an already-covered subtree
+            let mut duplicate = false;
+            for seen in &result {
+                if automation
+                    .CompareElements(&el, seen)
+                    .map(|same| same.as_bool())
+                    .unwrap_or(false)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if !duplicate {
+                result.push(el);
+            }
+        }
     }
-    // …give the activation a moment to land before closing the active tab
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    post_ctrl_w(hwnd);
-    true
+    result
+}
+
+/// True when the element contains a Button child (real tabs carry their
+/// close button; navigation-pane nodes matched as TabItem do not).
+unsafe fn has_close_button(automation: &IUIAutomation, el: &IUIAutomationElement) -> bool {
+    let Ok(cond) = automation.CreatePropertyCondition(
+        UIA_ControlTypePropertyId,
+        &VARIANT::from(UIA_ButtonControlTypeId.0 as i32),
+    ) else {
+        return false;
+    };
+    match el.FindFirst(TreeScope_Subtree, &cond) {
+        Ok(btn) => !btn.as_raw().is_null(),
+        Err(_) => false,
+    }
+}
+
+/// All TabItem names of an Explorer window (tab strip order), for
+/// diagnostics and tests — read-only, performs no actions.
+#[allow(dead_code)] // exercised by the ignored live diagnostics tests
+pub fn explorer_tab_names(hwnd: i64) -> Vec<String> {
+    std::thread::spawn(move || {
+        unsafe {
+            if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+                return Vec::new();
+            }
+        }
+        let names = unsafe {
+            let Some(automation) = uia_automation() else {
+                return Vec::new();
+            };
+            let flag_flipped = activate_accessibility(hwnd);
+            // trees build asynchronously — give Explorer a moment
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let names = find_all_tab_items(&automation, hwnd)
+                .iter()
+                .filter_map(|el| el.CurrentName().ok().map(|n| n.to_string()))
+                .collect();
+            if flag_flipped {
+                restore_screen_reader_flag();
+            }
+            names
+        };
+        unsafe { CoUninitialize() };
+        names
+    })
+    .join()
+    .unwrap_or_default()
+}
+
+/// Read-only dump of an Explorer window's UIA control tree (bounded depth),
+/// for diagnostics — performs no actions.
+#[allow(dead_code)] // exercised by the ignored live diagnostics tests
+pub fn explorer_tree_dump(hwnd: i64) -> Vec<String> {
+    std::thread::spawn(move || {
+        unsafe {
+            if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+                return vec!["CoInitializeEx failed".to_string()];
+            }
+        }
+        let out = unsafe {
+            let mut out = Vec::new();
+            let Some(automation) = uia_automation() else {
+                return vec!["CUIAutomation failed".to_string()];
+            };
+            let Ok(root) = automation.ElementFromHandle(HWND(hwnd as *mut _)) else {
+                return vec!["ElementFromHandle failed".to_string()];
+            };
+            let walker = match automation.ControlViewWalker() {
+                Ok(w) => w,
+                Err(e) => return vec![format!("ControlViewWalker failed: {e}")],
+            };
+            dump_element(&walker, &root, 0, &mut out);
+            out
+        };
+        unsafe { CoUninitialize() };
+        out
+    })
+    .join()
+    .unwrap_or_default()
+}
+
+unsafe fn dump_element(
+    walker: &IUIAutomationTreeWalker,
+    element: &IUIAutomationElement,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > 6 || out.len() > 250 {
+        return;
+    }
+    let name = element
+        .CurrentName()
+        .map(|b| b.to_string())
+        .unwrap_or_default();
+    let ctype = element.CurrentControlType().map(|t| t.0).unwrap_or(0);
+    let class = element
+        .CurrentClassName()
+        .map(|b| b.to_string())
+        .unwrap_or_default();
+    out.push(format!(
+        "{}ct={} class={:?} name={:?}",
+        "  ".repeat(depth),
+        ctype,
+        class,
+        name
+    ));
+
+    let mut child = walker.GetFirstChildElement(element).ok();
+    while let Some(c) = child {
+        dump_element(walker, &c, depth + 1, out);
+        if out.len() > 250 {
+            return;
+        }
+        child = walker.GetNextSiblingElement(&c).ok();
+    }
+}
+
+unsafe fn find_tab_item(
+    automation: &IUIAutomation,
+    hwnd: i64,
+    tab_title: &str,
+) -> Option<IUIAutomationElement> {
+    let mut fallback = None;
+    for el in find_all_tab_items(automation, hwnd) {
+        let name_matches = el
+            .CurrentName()
+            .map(|n| n.to_string() == tab_title)
+            .unwrap_or(false);
+        if !name_matches {
+            continue;
+        }
+        // Real tabs carry a close button; navigation-pane look-alikes don't.
+        if has_close_button(automation, &el) {
+            return Some(el);
+        }
+        if fallback.is_none() {
+            fallback = Some(el);
+        }
+    }
+    fallback
+}
+
+/// Invoke the close Button inside a TabItem (Invoke pattern, then
+/// LegacyIAccessible default action).
+unsafe fn invoke_tab_close_button(
+    automation: &IUIAutomation,
+    tab: &IUIAutomationElement,
+) -> bool {
+    let Ok(cond) = automation.CreatePropertyCondition(
+        UIA_ControlTypePropertyId,
+        &VARIANT::from(UIA_ButtonControlTypeId.0 as i32),
+    ) else {
+        return false;
+    };
+    let Ok(button) = tab.FindFirst(TreeScope_Subtree, &cond) else {
+        return false;
+    };
+    if let Ok(invoke) = button.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) {
+        if invoke.Invoke().is_ok() {
+            return true;
+        }
+    }
+    if let Ok(legacy) = button
+        .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(UIA_LegacyIAccessiblePatternId)
+    {
+        if legacy.DoDefaultAction().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn select_tab(tab: &IUIAutomationElement) -> bool {
+    match tab.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId) {
+        Ok(pattern) => pattern.Select().is_ok(),
+        Err(_) => false,
+    }
+}
+
+unsafe fn uia_close_tab(hwnd: i64, tab_title: &str) -> bool {
+    let Some(automation) = uia_automation() else {
+        return false;
+    };
+    let flag_flipped = activate_accessibility(hwnd);
+    // trees build asynchronously — give Explorer a moment
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let result = (|| {
+        let Some(tab) = find_tab_item(&automation, hwnd, tab_title) else {
+            return false;
+        };
+        // Only act on real tabs (they carry a close button). A name match
+        // without one is a navigation-pane look-alike — refuse rather than
+        // risk Ctrl+W closing the wrong tab.
+        if !has_close_button(&automation, &tab) {
+            return false;
+        }
+
+        // 1) The tab's own close button
+        if invoke_tab_close_button(&automation, &tab) {
+            return true;
+        }
+
+        // 2) Activate the tab, then Ctrl+W (closes exactly the active tab)
+        if select_tab(&tab) {
+            // give the activation a moment to land
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            post_ctrl_w(hwnd);
+            return true;
+        }
+
+        false
+    })();
+
+    if flag_flipped {
+        restore_screen_reader_flag();
+    }
+    result
 }
 
 fn post_ctrl_w(hwnd: i64) {
@@ -244,10 +531,16 @@ fn post_ctrl_w(hwnd: i64) {
         let h = HWND(hwnd as *mut _);
         let vk_ctrl = VK_CONTROL.0 as usize;
         let vk_w = 'W' as usize;
-        let _ = PostMessageW(h, WM_KEYDOWN, WPARAM(vk_ctrl), LPARAM(0));
-        let _ = PostMessageW(h, WM_KEYDOWN, WPARAM(vk_w), LPARAM(0));
-        let _ = PostMessageW(h, WM_KEYUP, WPARAM(vk_w), LPARAM(0));
-        let _ = PostMessageW(h, WM_KEYUP, WPARAM(vk_ctrl), LPARAM(0));
+        // lParam: repeat=1 | scan code << 16 (| previous/up transition bits)
+        let scan_ctrl = MapVirtualKeyW(vk_ctrl as u32, MAPVK_VK_TO_VSC) as isize;
+        let scan_w = MapVirtualKeyW(vk_w as u32, MAPVK_VK_TO_VSC) as isize;
+        let down = |scan: isize| LPARAM(1 | (scan << 16));
+        let up =
+            |scan: isize| LPARAM(1 | (scan << 16) | (1 << 30) | (1 << 31));
+        let _ = PostMessageW(h, WM_KEYDOWN, WPARAM(vk_ctrl), down(scan_ctrl));
+        let _ = PostMessageW(h, WM_KEYDOWN, WPARAM(vk_w), down(scan_w));
+        let _ = PostMessageW(h, WM_KEYUP, WPARAM(vk_w), up(scan_w));
+        let _ = PostMessageW(h, WM_KEYUP, WPARAM(vk_ctrl), up(scan_ctrl));
     }
 }
 
@@ -364,5 +657,62 @@ mod tests {
             }
             Err(_) => println!("COM enumeration failed"),
         }
+    }
+
+    /// Manual read-only diagnostic: shows each window's UIA TabItem names
+    /// next to the COM LocationName — verifies the name matching that
+    /// close_explorer_tab relies on. Performs no actions.
+    /// `cargo test --lib live_tab_names -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_tab_names() {
+        let items = super::enumerate_explorer_items().unwrap_or_default();
+        let mut seen_hwnds = std::collections::HashSet::new();
+        for i in items {
+            let Some(hwnd) = i.window_handle else { continue };
+            if !seen_hwnds.insert(hwnd) {
+                continue;
+            }
+            let names = super::explorer_tab_names(hwnd);
+            println!("hwnd={} com_title={:?}", hwnd, i.title);
+            println!("  uia tab names: {:?}", names);
+        }
+    }
+
+    /// Manual read-only diagnostic: dumps the UIA control tree of the first
+    /// Explorer window. `cargo test --lib live_tree_dump -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_tree_dump() {
+        let items = super::enumerate_explorer_items().unwrap_or_default();
+        let Some(first) = items.iter().find_map(|i| i.window_handle) else {
+            println!("no explorer windows open");
+            return;
+        };
+        println!("hwnd={} tree:", first);
+        for line in super::explorer_tree_dump(first) {
+            println!("{}", line);
+        }
+    }
+
+    /// Manual end-to-end test: closes OUR OWN throwaway window (open C:\
+    /// first). Never touches other windows — it filters by the exact title.
+    /// `cargo test --lib live_close_tab -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_close_tab() {
+        let items = super::enumerate_explorer_items().unwrap_or_default();
+        let Some(item) = items.iter().find(|i| i.title == "Windows-SSD (C:)").cloned() else {
+            println!("打开一个 C:\\ 资源管理器窗口后重跑");
+            return;
+        };
+        let Some(hwnd) = item.window_handle else { return };
+        let closed = super::close_explorer_tab(hwnd, &item.title);
+        println!("close_explorer_tab returned {}", closed);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let after = super::enumerate_explorer_items().unwrap_or_default();
+        let gone = !after.iter().any(|i| i.window_handle == Some(hwnd));
+        println!("window gone after close: {}", gone);
+        assert!(closed && gone, "close chain did not close the window");
     }
 }
