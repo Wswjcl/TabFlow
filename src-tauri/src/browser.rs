@@ -10,6 +10,12 @@
 //! Connections with a wrong token are dropped, so stray local processes
 //! can't inject fake tab data.
 //!
+//! MV3 service workers are recycled routinely (tens of seconds to minutes);
+//! that drops the socket without closing any tabs. A dead connection's last
+//! snapshot is therefore kept for [`DEAD_CONN_GRACE`] and only reaped once
+//! the browser fails to reconnect — otherwise the browser's tabs would
+//! flicker out of the list on every worker recycle.
+//!
 //! Protocol (JSON over WebSocket):
 //!   ext → app: {"type":"hello","token","browser","userAgent"}
 //!            {"type":"tabs","tabs":[{tabId,windowId,url,title,active}]}
@@ -25,6 +31,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -32,6 +39,16 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 pub const EXTENSION_PORT: u16 = 19876;
+
+/// How long a dead connection's last snapshot stays visible. The extension
+/// reconnects within seconds (timer) to a minute (alarm fallback) after an
+/// MV3 worker recycle; only a real browser quit outlives this.
+const DEAD_CONN_GRACE: Duration = Duration::from_secs(90);
+
+/// Registration counter. Each connection only mutates the registry entry it
+/// owns, so a stale socket draining buffered messages can't overwrite a
+/// newer connection's snapshot.
+static CONN_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// One tab as reported by the extension.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -51,6 +68,10 @@ pub struct ExtTab {
 struct Conn {
     tabs: Vec<ExtTab>,
     tx: mpsc::UnboundedSender<String>,
+    /// false once the socket died; the entry (and its tabs) is kept until
+    /// the grace period expires without a reconnect.
+    alive: bool,
+    generation: u64,
 }
 
 struct Hub {
@@ -74,11 +95,17 @@ pub fn start_extension_server(app: tauri::AppHandle) {
         let listener = match TcpListener::bind(("127.0.0.1", EXTENSION_PORT)).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Extension server: cannot bind 127.0.0.1:{}: {}", EXTENSION_PORT, e);
+                eprintln!(
+                    "Extension server: cannot bind 127.0.0.1:{}: {}",
+                    EXTENSION_PORT, e
+                );
                 return;
             }
         };
-        println!("Extension server listening on ws://127.0.0.1:{}", EXTENSION_PORT);
+        println!(
+            "Extension server listening on ws://127.0.0.1:{}",
+            EXTENSION_PORT
+        );
 
         loop {
             match listener.accept().await {
@@ -127,7 +154,9 @@ async fn handle_connection(app: tauri::AppHandle, stream: TcpStream) {
     };
     if hello["type"] != "hello" {
         let _ = write
-            .send(Message::Text(json!({"type": "error", "message": "expected hello"}).to_string()))
+            .send(Message::Text(
+                json!({"type": "error", "message": "expected hello"}).to_string(),
+            ))
             .await;
         return;
     }
@@ -135,17 +164,37 @@ async fn handle_connection(app: tauri::AppHandle, stream: TcpStream) {
     let token = hello["token"].as_str().unwrap_or_default();
     if token != hub().token {
         let _ = write
-            .send(Message::Text(json!({"type": "error", "message": "invalid token"}).to_string()))
+            .send(Message::Text(
+                json!({"type": "error", "message": "invalid token"}).to_string(),
+            ))
             .await;
-        eprintln!("Extension server: rejected connection for '{}' (bad token)", browser);
+        eprintln!(
+            "Extension server: rejected connection for '{}' (bad token)",
+            browser
+        );
         return;
     }
 
-    // 2. Register (replaces a stale connection for the same browser).
-    hub().conns.lock().await.insert(
-        browser.clone(),
-        Conn { tabs: Vec::new(), tx: tx.clone() },
-    );
+    // 2. Register. Keeps the previous snapshot: a reconnecting MV3 worker
+    //    pushes a fresh one milliseconds later, and a blank in between would
+    //    wipe the browser's tabs from the UI.
+    let generation = CONN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut conns = hub().conns.lock().await;
+        let prev_tabs = conns
+            .get(&browser)
+            .map(|c| c.tabs.clone())
+            .unwrap_or_default();
+        conns.insert(
+            browser.clone(),
+            Conn {
+                tabs: prev_tabs,
+                tx: tx.clone(),
+                alive: true,
+                generation,
+            },
+        );
+    }
     let _ = write
         .send(Message::Text(json!({"type": "hello_ack"}).to_string()))
         .await;
@@ -174,15 +223,18 @@ async fn handle_connection(app: tauri::AppHandle, stream: TcpStream) {
         };
         match value["type"].as_str() {
             Some("tabs") => {
-                if let Ok(mut tabs) = serde_json::from_value::<Vec<ExtTab>>(value["tabs"].clone()) {
-                    tabs.sort_by_key(|t| t.tab_id);
+                if let Some(tabs) = parse_tabs(&value["tabs"]) {
                     let snapshot: Vec<(i64, String)> =
                         tabs.iter().map(|t| (t.tab_id, t.url.clone())).collect();
                     let changed = snapshot != prev_snapshot;
                     prev_snapshot = snapshot;
-                    if let Some(conn) = hub().conns.lock().await.get_mut(&browser) {
-                        conn.tabs = tabs;
+                    let mut conns = hub().conns.lock().await;
+                    if let Some(conn) = conns.get_mut(&browser) {
+                        if conn.generation == generation {
+                            conn.tabs = tabs;
+                        }
                     }
+                    drop(conns);
                     if changed {
                         use tauri::Emitter;
                         let _ = app.emit("windows-updated", ());
@@ -194,22 +246,51 @@ async fn handle_connection(app: tauri::AppHandle, stream: TcpStream) {
         }
     }
 
-    // 5. Deregister (only if this connection is still the registered one).
-    let mut conns = hub().conns.lock().await;
-    if conns.get(&browser).map(|c| c.tx.same_channel(&tx)).unwrap_or(false) {
-        conns.remove(&browser);
-        use tauri::Emitter;
-        let _ = app.emit("windows-updated", ());
+    // 5. Socket died. Mark the entry dead but KEEP its last snapshot for
+    //    the grace period: MV3 service workers are recycled routinely and
+    //    reconnect within seconds — removing the entry now would make the
+    //    browser's tabs flicker out of the list (the auto-refresh deletes
+    //    their DB rows) and back in on every recycle. A reaper task removes
+    //    the entry once the browser clearly isn't coming back.
+    {
+        let mut conns = hub().conns.lock().await;
+        if let Some(conn) = conns.get_mut(&browser) {
+            if conn.generation == generation {
+                conn.alive = false;
+            }
+        }
     }
-    drop(conns);
     writer.abort();
-    println!("Extension disconnected: {}", browser);
+    {
+        let browser = browser.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(DEAD_CONN_GRACE).await;
+            let mut conns = hub().conns.lock().await;
+            let expired = match conns.get(&browser) {
+                Some(conn) => conn.generation == generation && !conn.alive,
+                None => false,
+            };
+            if expired {
+                conns.remove(&browser);
+                drop(conns);
+                use tauri::Emitter;
+                let _ = app.emit("windows-updated", ());
+            }
+        });
+    }
+    println!(
+        "Extension disconnected: {} (snapshot kept {}s)",
+        browser,
+        DEAD_CONN_GRACE.as_secs()
+    );
 }
 
 async fn broadcast(text: String) {
     let conns = hub().conns.lock().await;
     for conn in conns.values() {
-        let _ = conn.tx.send(text.clone());
+        if conn.alive {
+            let _ = conn.tx.send(text.clone());
+        }
     }
 }
 
@@ -304,6 +385,24 @@ pub async fn focus_any_tab(item_id: &str) -> bool {
     }
 }
 
+/// Parse a "tabs" payload leniently: undecodable entries are dropped instead
+/// of rejecting the whole snapshot (one malformed tab must not blank the
+/// browser's tab list). Returns None on a structurally invalid payload (not
+/// an array, or nothing decoded) — the caller then keeps the previous
+/// snapshot.
+fn parse_tabs(value: &serde_json::Value) -> Option<Vec<ExtTab>> {
+    let arr = value.as_array()?;
+    let mut tabs: Vec<ExtTab> = arr
+        .iter()
+        .filter_map(|t| serde_json::from_value::<ExtTab>(t.clone()).ok())
+        .collect();
+    if tabs.is_empty() && !arr.is_empty() {
+        return None;
+    }
+    tabs.sort_by_key(|t| t.tab_id);
+    Some(tabs)
+}
+
 fn parse_ext_id(id: &str) -> Option<(String, i64)> {
     let rest = id.strip_prefix("ext_")?;
     let (browser, tab) = rest.rsplit_once('_')?;
@@ -322,6 +421,17 @@ fn browser_exe(browser: &str) -> &str {
         "brave" => "brave",
         "vivaldi" => "vivaldi",
         _ => "chrome",
+    }
+}
+
+/// Inverse of [`browser_exe`]: map a process-style browser name (as CDP
+/// reports it, e.g. "msedge") to the extension's browser id ("edge") so the
+/// two channels can be compared when deciding which one owns a browser's
+/// tabs.
+pub fn canonical_ext_id(name: &str) -> &str {
+    match name {
+        "msedge" => "edge",
+        other => other,
     }
 }
 
@@ -361,7 +471,13 @@ pub async fn get_extension_status() -> ExtensionStatus {
             .iter()
             .map(|(browser, conn)| ConnectedBrowser {
                 browser: browser.clone(),
-                tab_count: conn.tabs.len(),
+                // Same filter as get_extension_tabs, so the indicator count
+                // always matches the number of list items.
+                tab_count: conn
+                    .tabs
+                    .iter()
+                    .filter(|t| !is_internal_url(&t.url))
+                    .count(),
             })
             .collect(),
     }
@@ -377,10 +493,7 @@ mod tests {
             parse_ext_id("ext_chrome_123456"),
             Some(("chrome".to_string(), 123456))
         );
-        assert_eq!(
-            parse_ext_id("ext_edge_42"),
-            Some(("edge".to_string(), 42))
-        );
+        assert_eq!(parse_ext_id("ext_edge_42"), Some(("edge".to_string(), 42)));
         assert_eq!(parse_ext_id("tab_123"), None);
         assert_eq!(parse_ext_id("ext_chrome_"), None);
         assert_eq!(parse_ext_id("ext__7"), None); // empty browser
@@ -411,5 +524,35 @@ mod tests {
         assert_eq!(tabs[1].tab_id, 9);
         assert_eq!(tabs[1].window_id, 0); // #[serde(default)]
         assert!(!tabs[1].active);
+    }
+
+    #[test]
+    fn parse_tabs_drops_bad_entries_not_the_snapshot() {
+        let value = serde_json::json!([
+            { "tabId": 5, "url": "https://x.com" },
+            { "url": "https://broken.com" }, // missing tabId
+            { "tabId": 9, "url": "https://y.com" },
+        ]);
+        let tabs = parse_tabs(&value).expect("valid entries survive");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].tab_id, 5); // sorted
+        assert_eq!(tabs[1].tab_id, 9);
+    }
+
+    #[test]
+    fn parse_tabs_rejects_structurally_invalid_payloads() {
+        assert_eq!(parse_tabs(&serde_json::json!("nope")), None);
+        assert_eq!(parse_tabs(&serde_json::json!([{ "url": "x" }])), None); // nothing decoded
+                                                                            // An empty array is a valid "no tabs open" snapshot
+        assert_eq!(parse_tabs(&serde_json::json!([])), Some(Vec::new()));
+    }
+
+    #[test]
+    fn canonicalizes_cdp_browser_names() {
+        // CDP reports the process name; extensions report the short id
+        assert_eq!(canonical_ext_id("msedge"), "edge");
+        assert_eq!(canonical_ext_id("edge"), "edge");
+        assert_eq!(canonical_ext_id("chrome"), "chrome");
+        assert_eq!(canonical_ext_id("opera"), "opera");
     }
 }

@@ -1,7 +1,7 @@
-use crate::platform::{self, TrackedItem, ItemType};
-use crate::db;
-use crate::cdp;
 use crate::browser;
+use crate::cdp;
+use crate::db;
+use crate::platform::{self, ItemType, TrackedItem};
 use std::collections::HashSet;
 use tokio::sync::Mutex;
 
@@ -20,14 +20,16 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
     let ext_tabs = browser::get_extension_tabs().await;
     let ext_browsers: HashSet<String> = browser::connected_browsers().await.into_iter().collect();
 
-    // 2. CDP tabs (requires debug mode) for browsers WITHOUT an extension
+    // 2. CDP tabs (requires debug mode) for browsers WITHOUT an extension.
+    //    CDP reports process names ("msedge") while extensions register
+    //    short ids ("edge") — canonicalize before comparing.
     let cdp_tabs: Vec<TrackedItem> = cdp::fetch_browser_tabs()
         .await
         .into_iter()
         .filter(|t| {
             t.browser_name
                 .as_deref()
-                .map(|b| !ext_browsers.contains(b))
+                .map(|b| !ext_browsers.contains(browser::canonical_ext_id(b)))
                 .unwrap_or(true)
         })
         .collect();
@@ -45,7 +47,10 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
             explorer_tabs = tabs;
             window_items.retain(|it| it.item_type != ItemType::ExplorerWindow);
         }
-        Err(e) => eprintln!("Explorer COM enumeration failed, falling back to EnumWindows: {:?}", e),
+        Err(e) => eprintln!(
+            "Explorer COM enumeration failed, falling back to EnumWindows: {:?}",
+            e
+        ),
     }
 
     // 5. Merge: extension tabs + CDP tabs (if any) + explorer tabs + windows
@@ -82,9 +87,7 @@ pub async fn get_tracked_items() -> Result<Vec<TrackedItem>, String> {
     }
 
     // 6. Return from DB
-    db::get_all_tracked_items()
-        .await
-        .map_err(|e| e.to_string())
+    db::get_all_tracked_items().await.map_err(|e| e.to_string())
 }
 
 /// Get all current windows (real-time snapshot, does not touch DB)
