@@ -81,13 +81,20 @@ pub use windows::{enumerate_windows, find_window_handle_by_process};
 #[cfg(target_os = "windows")]
 mod explorer;
 #[cfg(target_os = "windows")]
-pub use explorer::{can_close_explorer_window, enumerate_explorer_items};
+pub use explorer::{
+    can_close_explorer_window, close_explorer_tab, enumerate_explorer_items,
+};
 
 #[cfg(not(target_os = "windows"))]
 /// COM enumeration unavailable outside Windows → Err triggers the
 /// EnumWindows fallback in the caller.
 pub fn enumerate_explorer_items() -> Result<Vec<TrackedItem>, ()> {
     Err(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn close_explorer_tab(_hwnd: i64, _tab_title: &str) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]

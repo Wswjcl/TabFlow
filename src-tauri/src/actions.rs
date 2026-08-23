@@ -61,9 +61,16 @@ pub async fn close_window(item_id: String) -> Result<bool, String> {
             if item.item_type == ItemType::ExplorerWindow
                 && !platform::can_close_explorer_window(hwnd, &items)
             {
-                // Multi-tab Explorer window: closing the shared HWND would
-                // kill sibling tabs — refuse instead.
-                return Ok(false);
+                // Multi-tab Explorer window: close just this tab via UIA
+                // instead of killing the whole window
+                let title = item.title.clone();
+                let closed = tokio::task::spawn_blocking(move || {
+                    platform::close_explorer_tab(hwnd, &title)
+                })
+                .await
+                .unwrap_or(false);
+                let _ = db::delete_tracked_item(&item_id).await;
+                return Ok(closed);
             }
             let closed = close_window_by_handle(hwnd);
             // Always delete from DB — next scan will re-add if still open

@@ -9,18 +9,21 @@
 //! Limitations (documented trade-offs):
 //! - Virtual folders (This PC, Recycle Bin) have no file:// URL; they are
 //!   kept with path = None and don't participate in duplicate detection.
-//! - Closing a single tab is only safe when its window has no sibling tabs
-//!   (closing the shared HWND would kill them all) — see
-//!   [`can_close_explorer_window`].
+//! - Closing tabs: single-tab windows close via the window handle; tabs in
+//!   multi-tab windows close via UI Automation (select the TabItem, then
+//!   Ctrl+W) — see [`close_explorer_tab`]. If the tab strip isn't reachable
+//!   over UIA the close is skipped rather than risking the whole window.
 
 use super::{ItemType, TrackedItem};
 use chrono::Utc;
 use std::collections::HashMap;
 use windows::core::{GUID, Interface, VARIANT};
-use windows::Win32::Foundation::{HWND, SHANDLE_PTR};
+use windows::Win32::Foundation::{HWND, LPARAM, SHANDLE_PTR, WPARAM};
 use windows::Win32::System::Com::*;
+use windows::Win32::UI::Accessibility::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2};
-use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, PostMessageW, WM_KEYDOWN, WM_KEYUP};
 
 /// CLSID of the ShellWindows coclass (not exposed by the windows crate).
 const CLSID_SHELL_WINDOWS: GUID = GUID::from_u128(0x9BA05972_F6A8_11CF_A442_00A0C90A8F39);
@@ -162,6 +165,90 @@ pub fn can_close_explorer_window(hwnd: i64, items: &[TrackedItem]) -> bool {
         .filter(|i| i.item_type == ItemType::ExplorerWindow && i.window_handle == Some(hwnd))
         .count()
         <= 1
+}
+
+/// Close a single Explorer tab in a multi-tab window via UI Automation:
+/// select the TabItem whose name matches `tab_title`, then post Ctrl+W
+/// (closes exactly the active tab). Falls back to false when the tab strip
+/// isn't reachable — callers should then leave the tab alone.
+///
+/// Same-folder tabs are interchangeable, so closing "a tab named X" is
+/// equivalent to closing any specific one of them.
+pub fn close_explorer_tab(hwnd: i64, tab_title: &str) -> bool {
+    let title = tab_title.to_string();
+    std::thread::spawn(move || {
+        unsafe {
+            if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+                return false;
+            }
+        }
+        let ok = unsafe { uia_close_tab(hwnd, &title) };
+        unsafe { CoUninitialize() };
+        ok
+    })
+    .join()
+    .unwrap_or(false)
+}
+
+unsafe fn uia_close_tab(hwnd: i64, tab_title: &str) -> bool {
+    let automation: IUIAutomation =
+        match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+    let root = match automation.ElementFromHandle(HWND(hwnd as *mut _)) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    // TabItem with matching display name in this window's tab strip
+    let name_cond = automation.CreatePropertyCondition(
+        UIA_NamePropertyId,
+        &VARIANT::from(tab_title),
+    );
+    let type_cond = automation.CreatePropertyCondition(
+        UIA_ControlTypePropertyId,
+        &VARIANT::from(UIA_TabItemControlTypeId.0 as i32),
+    );
+    let (name_cond, type_cond) = match (name_cond, type_cond) {
+        (Ok(n), Ok(t)) => (n, t),
+        _ => return false,
+    };
+    let cond = match automation.CreateAndCondition(&name_cond, &type_cond) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let tab = match root.FindFirst(TreeScope_Subtree, &cond) {
+        Ok(t) => t, // a null/no-match result fails below on pattern lookup
+        Err(_) => return false,
+    };
+
+    // Activate the tab…
+    let selection: IUIAutomationSelectionItemPattern =
+        match tab.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+        {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+    if selection.Select().is_err() {
+        return false;
+    }
+    // …give the activation a moment to land before closing the active tab
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    post_ctrl_w(hwnd);
+    true
+}
+
+fn post_ctrl_w(hwnd: i64) {
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let vk_ctrl = VK_CONTROL.0 as usize;
+        let vk_w = 'W' as usize;
+        let _ = PostMessageW(h, WM_KEYDOWN, WPARAM(vk_ctrl), LPARAM(0));
+        let _ = PostMessageW(h, WM_KEYDOWN, WPARAM(vk_w), LPARAM(0));
+        let _ = PostMessageW(h, WM_KEYUP, WPARAM(vk_w), LPARAM(0));
+        let _ = PostMessageW(h, WM_KEYUP, WPARAM(vk_ctrl), LPARAM(0));
+    }
 }
 
 /// Convert a `file:///C:/foo%20bar` LocationURL into a normal Windows path.

@@ -176,9 +176,14 @@ pub async fn close_duplicates(
                     if item.item_type == ItemType::ExplorerWindow
                         && !crate::platform::can_close_explorer_window(hwnd, &all_items)
                     {
-                        // Multi-tab window: closing the shared HWND would
-                        // kill sibling tabs — leave it to the user.
-                        false
+                        // Multi-tab window: close just this tab via UIA
+                        // (closing the shared HWND would kill sibling tabs)
+                        let title = item.title.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::platform::close_explorer_tab(hwnd, &title)
+                        })
+                        .await
+                        .unwrap_or(false)
                     } else {
                         close_single_window(hwnd)
                     }
