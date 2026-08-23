@@ -111,6 +111,29 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
         item_type: ItemType::from_str(row.get::<String, _>("item_type").as_str()),
         browser_name: row.get("browser_name"),
         last_active_at: row.get("last_active_at"),
+        task_ids: Vec::new(),
+    }
+}
+
+/// Fill `task_ids` from the item_tasks assignments (matched via resource keys).
+async fn attach_task_ids(items: &mut Vec<TrackedItem>) {
+    let assigns: Vec<(String, String)> =
+        match sqlx::query_as("SELECT resource_key, task_id FROM item_tasks")
+            .fetch_all(pool().await)
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, task) in assigns {
+        map.entry(key).or_default().push(task);
+    }
+    for item in items {
+        let key = crate::duplicate::resource_key(item);
+        if let Some(ids) = map.get(&key) {
+            item.task_ids = ids.clone();
+        }
     }
 }
 
@@ -129,7 +152,9 @@ pub async fn get_all_tracked_items() -> Result<Vec<TrackedItem>, sqlx::Error> {
     .fetch_all(pool().await)
     .await?;
 
-    Ok(rows.iter().map(|r| row_to_item(r)).collect())
+    let mut items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
+    attach_task_ids(&mut items).await;
+    Ok(items)
 }
 
 /// Atomically bring tracked_items in sync with a fresh scan:
@@ -229,7 +254,9 @@ pub async fn search_items(query: &str) -> Result<Vec<TrackedItem>, sqlx::Error> 
     .fetch_all(pool().await)
     .await?;
 
-    Ok(rows.iter().map(|r| row_to_item(r)).collect())
+    let mut items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
+    attach_task_ids(&mut items).await;
+    Ok(items)
 }
 
 // ─── Duplicate Groups ─────────────────────────────────────
@@ -393,6 +420,7 @@ pub async fn get_task_items(task_id: &str) -> Result<Vec<TrackedItem>, sqlx::Err
             .await?;
     let key_set: HashSet<String> = keys.into_iter().map(|(k,)| k).collect();
 
+    // get_all_tracked_items already attached task_ids
     let items = get_all_tracked_items().await?;
     Ok(items
         .into_iter()

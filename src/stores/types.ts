@@ -10,6 +10,8 @@ export interface TrackedItem {
   item_type: "browser_tab" | "explorer_window" | "app_window";
   browser_name: string | null;
   last_active_at: string;
+  /** Task ids assigned to this item's resource (backend-attached) */
+  task_ids: string[];
 }
 
 export interface DuplicateGroup {

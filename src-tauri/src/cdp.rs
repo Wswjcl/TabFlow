@@ -160,6 +160,7 @@ pub async fn fetch_browser_tabs() -> Vec<TrackedItem> {
                 item_type: ItemType::BrowserTab,
                 browser_name: Some(browser.to_string()),
                 last_active_at: now.clone(),
+                task_ids: Vec::new(),
             });
         }
     }

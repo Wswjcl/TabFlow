@@ -12,6 +12,8 @@ pub struct TrackedItem {
     pub item_type: ItemType,
     pub browser_name: Option<String>,
     pub last_active_at: String,
+    /// Tasks this item's resource is assigned to (filled by db queries)
+    pub task_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
