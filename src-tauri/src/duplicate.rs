@@ -46,12 +46,17 @@ pub fn resource_key(item: &TrackedItem) -> String {
 
 /// Normalize a URL for duplicate comparison:
 /// - treat http and https as equivalent, lowercase scheme+host
-/// - drop the fragment (#...)
+/// - drop pure anchor fragments (#section) but KEEP hash routes (#/page?…):
+///   SPAs put page identity in the fragment - dropping it wholesale judged
+///   distinct pages (e.g. docs site chapters) as duplicates
 /// - strip known tracking query params (utm_*, gclid, ...) while keeping
 ///   meaningful ones (e.g. search queries) so different searches still differ
 /// - trim trailing slashes
 fn normalize_url(url: &str) -> String {
-    let no_fragment = url.split('#').next().unwrap_or(url);
+    let (no_fragment, fragment) = match url.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (url, None),
+    };
     let (base, query) = match no_fragment.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None => (no_fragment, None),
@@ -77,7 +82,12 @@ fn normalize_url(url: &str) -> String {
         })
         .unwrap_or_default();
 
-    format!("{}{}", base_trimmed, filtered_query)
+    let kept_fragment = fragment
+        .filter(|f| f.contains('/') || f.contains('?'))
+        .map(|f| format!("#{}", f))
+        .unwrap_or_default();
+
+    format!("{}{}{}", base_trimmed, filtered_query, kept_fragment)
 }
 
 fn is_tracking_param(key: &str) -> bool {
@@ -270,5 +280,37 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].match_pattern, "url:chrome://newtab");
         assert_eq!(groups[0].count, 2);
+    }
+
+    /// Hash-routed SPAs put page identity after '#': dropping the fragment
+    /// wholesale judged distinct chapters of e.g. docs sites as duplicates.
+    #[test]
+    fn hash_routed_pages_stay_distinct() {
+        let items = vec![
+            ext_tab("ext_chrome_1", "https://docs.example.com/guide#/intro", "chrome"),
+            ext_tab("ext_chrome_2", "https://docs.example.com/guide#/advanced", "chrome"),
+            ext_tab("ext_chrome_3", "https://app.example.com/#/search?q=foo", "chrome"),
+            ext_tab("ext_chrome_4", "https://app.example.com/#/search?q=bar", "chrome"),
+        ];
+        let groups = find_duplicates(&items);
+        assert!(
+            groups.is_empty(),
+            "different hash routes are different pages, got {:?}",
+            groups.iter().map(|g| &g.match_pattern).collect::<Vec<_>>()
+        );
+    }
+
+    /// Pure anchor fragments (in-page scroll positions) still merge: the
+    /// user opened the same page twice, just scrolled elsewhere.
+    #[test]
+    fn anchor_only_fragments_still_merge() {
+        let items = vec![
+            ext_tab("ext_chrome_1", "https://example.com/manual#chapter-1", "chrome"),
+            ext_tab("ext_chrome_2", "https://example.com/manual#chapter-9", "chrome"),
+        ];
+        let groups = find_duplicates(&items);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(groups[0].match_pattern, "url:http://example.com/manual");
     }
 }

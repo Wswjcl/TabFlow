@@ -432,11 +432,19 @@ pub async fn get_task_items(task_id: &str) -> Result<Vec<TrackedItem>, sqlx::Err
             .await?;
     let key_set: HashSet<String> = keys.into_iter().map(|(k,)| k).collect();
 
-    // get_all_tracked_items already attached task_ids
+    // get_all_tracked_items already attached task_ids. Return ONE row per
+    // tracked resource: duplicate instances of the same page share the
+    // resource key and would all flood the task view otherwise. Items come
+    // back ordered by last_active_at DESC, so the first is the most recent
+    // live instance of the resource.
     let items = get_all_tracked_items().await?;
+    let mut seen: HashSet<String> = HashSet::new();
     Ok(items
         .into_iter()
-        .filter(|i| key_set.contains(&crate::duplicate::resource_key(i)))
+        .filter(|i| {
+            let key = crate::duplicate::resource_key(i);
+            key_set.contains(&key) && seen.insert(key)
+        })
         .collect())
 }
 
