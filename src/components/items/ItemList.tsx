@@ -30,17 +30,26 @@ export function ItemList() {
     return items;
   }, [items, selectedTaskId, taskItems]);
 
+  // Duplicate warnings are an overview feature: the browser/explorer/app
+  // views and task views list only their own pages, without cross-view
+  // duplicate groups mixed in.
+  const showDuplicates = selectedTaskId === null;
+  const visibleDuplicates = showDuplicates ? duplicates : [];
+
   // Items that are part of duplicate groups
   const dupItemIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const g of duplicates) {
+    for (const g of visibleDuplicates) {
       for (const item of g.items) {
         ids.add(item.id);
       }
     }
     return ids;
-  }, [duplicates]);
+  }, [visibleDuplicates]);
 
+  // Overview pulls group members out into the warning cards; filtered
+  // views keep every tracked page as a normal row (duplicates are cleaned
+  // from the overview, not from the per-type/task lists).
   const standaloneItems = useMemo(
     () => filtered.filter((i) => !dupItemIds.has(i.id)),
     [filtered, dupItemIds]
@@ -82,7 +91,7 @@ export function ItemList() {
   }
 
   // ── Empty ──
-  if (!loading && filtered.length === 0 && duplicates.length === 0) {
+  if (!loading && filtered.length === 0 && visibleDuplicates.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground gap-2 p-8">
         <Sparkles className="w-8 h-8 opacity-30" />
@@ -99,16 +108,16 @@ export function ItemList() {
 
   return (
     <ScrollArea className="flex-1 p-4">
-      {/* Duplicates section */}
-      {duplicates.length > 0 && (
+      {/* Duplicates section (overview only) */}
+      {visibleDuplicates.length > 0 && (
         <div className="mb-6">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <span className="text-sm font-semibold text-destructive">
-                {duplicates.length} 组重复
+                {visibleDuplicates.length} 组重复
               </span>
               <span className="text-xs text-muted-foreground">
-                ({duplicates.reduce((s, g) => s + g.items.length, 0)} 个窗口)
+                ({visibleDuplicates.reduce((s, g) => s + g.items.length, 0)} 个窗口)
               </span>
             </div>
             <Button variant="destructive" size="sm" onClick={handleCloseAll}>
@@ -117,7 +126,7 @@ export function ItemList() {
           </div>
 
           <div className="space-y-3">
-            {duplicates.map((group) => (
+            {visibleDuplicates.map((group) => (
               <DuplicateGroup key={group.id} group={group} />
             ))}
           </div>
@@ -141,8 +150,8 @@ export function ItemList() {
         </div>
       )}
 
-      {/* If filtered but only duplicates exist */}
-      {standaloneItems.length === 0 && duplicates.length > 0 && (
+      {/* If overview is filtered down to only duplicates */}
+      {standaloneItems.length === 0 && visibleDuplicates.length > 0 && (
         <div className="text-center text-xs text-muted-foreground py-8">
           当前筛选下无独立窗口（所有项都在重复组中）
         </div>
