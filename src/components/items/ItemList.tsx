@@ -30,33 +30,44 @@ export function ItemList() {
     return items;
   }, [items, selectedTaskId, taskItems]);
 
-  // Duplicate warnings are an overview feature: the browser/explorer/app
-  // views and task views list only their own pages, without cross-view
-  // duplicate groups mixed in.
-  const showDuplicates = selectedTaskId === null;
-  const visibleDuplicates = showDuplicates ? duplicates : [];
+  // Duplicate warnings follow the active view's scope: the overview shows
+  // every group, type filters show only their own item type's groups, and
+  // task views stay clean lists (their resources are already deduped to one
+  // row per key by the backend).
+  const scopedDuplicates = useMemo(() => {
+    if (selectedTaskId === null) return duplicates;
+    const typeFilter =
+      selectedTaskId === FILTER_BROWSER
+        ? "browser_tab"
+        : selectedTaskId === FILTER_EXPLORER
+          ? "explorer_window"
+          : selectedTaskId === FILTER_APP
+            ? "app_window"
+            : null;
+    if (typeFilter === null) return [];
+    return duplicates.filter((g) =>
+      g.items.every((i) => i.item_type === typeFilter)
+    );
+  }, [duplicates, selectedTaskId]);
 
   // Items that are part of duplicate groups
   const dupItemIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const g of visibleDuplicates) {
+    for (const g of scopedDuplicates) {
       for (const item of g.items) {
         ids.add(item.id);
       }
     }
     return ids;
-  }, [visibleDuplicates]);
+  }, [scopedDuplicates]);
 
-  // Overview pulls group members out into the warning cards; filtered
-  // views keep every tracked page as a normal row (duplicates are cleaned
-  // from the overview, not from the per-type/task lists).
   const standaloneItems = useMemo(
     () => filtered.filter((i) => !dupItemIds.has(i.id)),
     [filtered, dupItemIds]
   );
 
   const handleCloseAll = async () => {
-    const allGroupIds = duplicates.flatMap((g) => [g.id, g.match_pattern]);
+    const allGroupIds = scopedDuplicates.flatMap((g) => [g.id, g.match_pattern]);
     await closeDuplicates(allGroupIds);
   };
 
@@ -91,7 +102,7 @@ export function ItemList() {
   }
 
   // ── Empty ──
-  if (!loading && filtered.length === 0 && visibleDuplicates.length === 0) {
+  if (!loading && filtered.length === 0 && scopedDuplicates.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground gap-2 p-8">
         <Sparkles className="w-8 h-8 opacity-30" />
@@ -108,16 +119,16 @@ export function ItemList() {
 
   return (
     <ScrollArea className="flex-1 p-4">
-      {/* Duplicates section (overview only) */}
-      {visibleDuplicates.length > 0 && (
+      {/* Duplicates section, scoped to the active view */}
+      {scopedDuplicates.length > 0 && (
         <div className="mb-6">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <span className="text-sm font-semibold text-destructive">
-                {visibleDuplicates.length} 组重复
+                {scopedDuplicates.length} 组重复
               </span>
               <span className="text-xs text-muted-foreground">
-                ({visibleDuplicates.reduce((s, g) => s + g.items.length, 0)} 个窗口)
+                ({scopedDuplicates.reduce((s, g) => s + g.items.length, 0)} 个窗口)
               </span>
             </div>
             <Button variant="destructive" size="sm" onClick={handleCloseAll}>
@@ -126,7 +137,7 @@ export function ItemList() {
           </div>
 
           <div className="space-y-3">
-            {visibleDuplicates.map((group) => (
+            {scopedDuplicates.map((group) => (
               <DuplicateGroup key={group.id} group={group} />
             ))}
           </div>
@@ -150,8 +161,8 @@ export function ItemList() {
         </div>
       )}
 
-      {/* If overview is filtered down to only duplicates */}
-      {standaloneItems.length === 0 && visibleDuplicates.length > 0 && (
+      {/* If every item of the view sits inside a duplicate group */}
+      {standaloneItems.length === 0 && scopedDuplicates.length > 0 && (
         <div className="text-center text-xs text-muted-foreground py-8">
           当前筛选下无独立窗口（所有项都在重复组中）
         </div>
