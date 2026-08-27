@@ -41,6 +41,15 @@ pub fn run() {
             // from normally-running browsers; no debug flag needed)
             browser::start_extension_server(app.handle().clone());
 
+            // Undecorated main window: re-add WS_SYSMENU so the taskbar
+            // thumbnail right-click menu and click-to-restore work.
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(hwnd) = window.hwnd() {
+                    platform::restore_system_menu(hwnd.0 as isize);
+                }
+            }
+
             // System-wide Ctrl+Shift+F toggles the search overlay.
             // The webview listens for the "toggle-search" event. Registration
             // failure (hotkey already taken) only logs — the UI keeps working.

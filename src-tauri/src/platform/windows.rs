@@ -79,6 +79,36 @@ fn process_image_name(pid: u32) -> Option<String> {
     }
 }
 
+/// Undecorated windows lose the WS_SYSMENU style, which the Windows taskbar
+/// relies on for the thumbnail hover preview's right-click menu and for
+/// click-to-restore. Re-adding the style is invisible on an undecorated
+/// window but restores those interactions (plus the Alt+Space menu).
+pub fn restore_system_menu(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_SYSMENU,
+    };
+
+    unsafe {
+        let hwnd = HWND(hwnd as _);
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        if style & WS_SYSMENU.0 as i32 == 0 {
+            SetWindowLongW(hwnd, GWL_STYLE, style | WS_SYSMENU.0 as i32);
+            // Let the shell re-read the window styles.
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
 unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let items = &mut *(lparam.0 as *mut Vec<TrackedItem>);
 

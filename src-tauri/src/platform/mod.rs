@@ -90,7 +90,7 @@ pub struct Stats {
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{enumerate_windows, find_window_handle_by_process};
+pub use windows::{enumerate_windows, find_window_handle_by_process, restore_system_menu};
 
 #[cfg(target_os = "windows")]
 mod explorer;
