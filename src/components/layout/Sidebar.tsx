@@ -1,6 +1,11 @@
 import React from "react";
-import { useTaskStore, useUIStore } from "@/stores";
-import { FILTER_APP, FILTER_BROWSER, FILTER_EXPLORER } from "@/stores/types";
+import { useTaskStore, useUIStore, useWindowStore } from "@/stores";
+import {
+  FILTER_APP,
+  FILTER_BROWSER,
+  FILTER_EXPLORER,
+  FILTER_IGNORED,
+} from "@/stores/types";
 import { TaskPanel } from "@/components/tasks/TaskPanel";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -10,6 +15,7 @@ import {
   Globe,
   FolderOpen,
   Monitor,
+  EyeOff,
   PanelLeftClose,
   PanelLeft,
 } from "lucide-react";
@@ -17,6 +23,7 @@ import {
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar } = useUIStore();
   const { selectedTaskId, selectTask } = useTaskStore();
+  const ignoredCount = useWindowStore((s) => s.ignored.length);
 
   if (sidebarCollapsed) {
     return (
@@ -85,6 +92,13 @@ export function Sidebar() {
             label="应用窗口"
             active={selectedTaskId === FILTER_APP}
             onClick={() => selectTask(FILTER_APP)}
+          />
+          <SidebarItem
+            icon={<EyeOff className="w-4 h-4" />}
+            label="已忽略"
+            badge={ignoredCount}
+            active={selectedTaskId === FILTER_IGNORED}
+            onClick={() => selectTask(FILTER_IGNORED)}
           />
         </div>
 

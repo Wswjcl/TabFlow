@@ -82,6 +82,15 @@ pub async fn init_db(data_dir: Option<std::path::PathBuf>) -> Result<(), Box<dyn
             detected_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- Resources the user explicitly removed from tracking. Matched by
+        -- the same stable resource key as task assignments, so an ignored
+        -- page stays ignored across window instances and app restarts.
+        CREATE TABLE IF NOT EXISTS ignored_resources (
+            resource_key TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tracked_items_type ON tracked_items(item_type);
         CREATE INDEX IF NOT EXISTS idx_tracked_items_process ON tracked_items(process_name);
         CREATE INDEX IF NOT EXISTS idx_tracked_items_title ON tracked_items(title);
@@ -138,17 +147,30 @@ async fn attach_task_ids(items: &mut Vec<TrackedItem>) {
     }
 }
 
-/// Post-process DB rows into fully-populated items: task assignments and
-/// real app icons (icons aren't persisted — they come from the in-memory
-/// per-process cache, so every consumer gets them).
+/// Post-process DB rows into fully-populated items: task assignments, real
+/// app icons (icons aren't persisted - they come from the in-memory
+/// per-process cache), and the ignore filter - every consumer (list,
+/// duplicates, search, stats) reads through this.
 async fn hydrate_items(mut items: Vec<TrackedItem>) -> Vec<TrackedItem> {
     attach_task_ids(&mut items).await;
+    let ignored = load_ignored_keys().await;
+    if !ignored.is_empty() {
+        items.retain(|item| !ignored.contains(&crate::duplicate::resource_key(item)));
+    }
     for item in items.iter_mut() {
         if item.icon.is_none() {
             item.icon = crate::platform::process_icon(&item.process_name);
         }
     }
     items
+}
+
+async fn load_ignored_keys() -> std::collections::HashSet<String> {
+    sqlx::query_as::<_, (String,)>("SELECT resource_key FROM ignored_resources")
+        .fetch_all(pool().await)
+        .await
+        .map(|rows| rows.into_iter().map(|(k,)| k).collect())
+        .unwrap_or_default()
 }
 
 const ITEM_COLUMNS: &str =
@@ -448,48 +470,90 @@ pub async fn get_task_items(task_id: &str) -> Result<Vec<TrackedItem>, sqlx::Err
         .collect())
 }
 
+// ─── Ignored Resources ────────────────────────────────────
+
+/// Stop tracking an item: its resource key goes onto the ignore list, so
+/// the page disappears from the list/duplicates/stats until unignored
+/// (even after the window is closed and reopened).
+#[tauri::command]
+pub async fn ignore_item(item_id: String) -> Result<(), String> {
+    let item = get_tracked_item(&item_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("item not found: {}", item_id))?;
+    let key = crate::duplicate::resource_key(&item);
+
+    sqlx::query("INSERT OR IGNORE INTO ignored_resources (resource_key, title) VALUES (?, ?)")
+        .bind(&key)
+        .bind(&item.title)
+        .execute(pool().await)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Resume tracking a previously ignored resource.
+#[tauri::command]
+pub async fn unignore_resource(resource_key: String) -> Result<(), String> {
+    sqlx::query("DELETE FROM ignored_resources WHERE resource_key = ?")
+        .bind(&resource_key)
+        .execute(pool().await)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// All ignored resources (for the management view), newest first.
+#[tauri::command]
+pub async fn get_ignored_resources() -> Result<Vec<crate::platform::IgnoredResource>, String> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "SELECT resource_key, title, created_at FROM ignored_resources ORDER BY created_at DESC, resource_key ASC",
+    )
+    .fetch_all(pool().await)
+    .await
+    .map_err(|e| e.to_string())
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(resource_key, title, created_at)| crate::platform::IgnoredResource {
+                resource_key,
+                title,
+                created_at,
+            })
+            .collect()
+    })
+}
+
 // ─── Stats ────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_stats() -> Result<Stats, String> {
-    let pool = pool().await;
-
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tracked_items")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let browser: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tracked_items WHERE item_type = 'browser_tab'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let explorer: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tracked_items WHERE item_type = 'explorer_window'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let apps: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tracked_items WHERE item_type = 'app_window'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
+    // Count from the hydrated (ignore-filtered) item list so ignored
+    // resources stay out of the numbers, exactly like out of the list.
+    let items = get_all_tracked_items().await.map_err(|e| e.to_string())?;
+    let mut browser = 0i64;
+    let mut explorer = 0i64;
+    let mut apps = 0i64;
+    for item in &items {
+        match item.item_type {
+            crate::platform::ItemType::BrowserTab => browser += 1,
+            crate::platform::ItemType::ExplorerWindow => explorer += 1,
+            crate::platform::ItemType::AppWindow => apps += 1,
+        }
+    }
 
     let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
-        .fetch_one(pool)
+        .fetch_one(pool().await)
         .await
         .map_err(|e| e.to_string())?;
 
     let dupes: i64 =
         sqlx::query_scalar("SELECT COALESCE(SUM(item_count - 1), 0) FROM duplicate_groups")
-            .fetch_one(pool)
+            .fetch_one(pool().await)
             .await
             .map_err(|e| e.to_string())?;
 
     Ok(Stats {
-        total_items: total,
+        total_items: items.len() as i64,
         duplicate_count: dupes,
         browser_tabs: browser,
         explorer_windows: explorer,

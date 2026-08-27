@@ -1,7 +1,7 @@
 import { useEffect } from "react";
-import { useTaskStore } from "@/stores";
+import { useTaskStore, useWindowStore } from "@/stores";
 import type { TrackedItem } from "@/stores/types";
-import { Check, FolderKanban } from "lucide-react";
+import { Check, EyeOff, FolderKanban } from "lucide-react";
 
 interface Props {
   x: number;
@@ -10,11 +10,13 @@ interface Props {
   onClose: () => void;
 }
 
-/** Right-click menu on an item: toggle which tasks track this resource. */
+/** Right-click menu on an item: toggle which tasks track this resource,
+ *  or stop tracking it entirely. */
 export function TaskContextMenu({ x, y, item, onClose }: Props) {
   const tasks = useTaskStore((s) => s.tasks);
   const assignToTask = useTaskStore((s) => s.assignToTask);
   const unassignFromTask = useTaskStore((s) => s.unassignFromTask);
+  const ignoreItem = useWindowStore((s) => s.ignoreItem);
   const assigned = new Set(item.task_ids);
 
   useEffect(() => {
@@ -86,6 +88,20 @@ export function TaskContextMenu({ x, y, item, onClose }: Props) {
             )}
           </button>
         ))}
+
+        {/* Ignore tracking: removes this resource from the app entirely */}
+        <div className="my-1 border-t border-border/60" />
+        <button
+          onClick={() => {
+            ignoreItem(item.id);
+            onClose();
+          }}
+          className="flex items-center gap-2 w-full px-3 py-1.5 hover:bg-accent transition-colors text-left"
+          title="不再追踪此页面（可在侧边栏「已忽略」中恢复）"
+        >
+          <EyeOff className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+          <span className="flex-1">忽略追踪</span>
+        </button>
       </div>
     </>
   );

@@ -32,6 +32,12 @@ export interface Task {
   item_count: number | null;
 }
 
+export interface IgnoredResource {
+  resource_key: string;
+  title: string;
+  created_at: string;
+}
+
 export interface Stats {
   total_items: number;
   duplicate_count: number;
@@ -60,6 +66,7 @@ export interface ExtensionStatus {
 export const FILTER_BROWSER = "__filter_browser";
 export const FILTER_EXPLORER = "__filter_explorer";
 export const FILTER_APP = "__filter_app";
+export const FILTER_IGNORED = "__filter_ignored";
 
 export function isFilterId(id: string | null): id is string {
   return id != null && id.startsWith("__filter_");

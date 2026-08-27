@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { TrackedItem, DuplicateGroup, Task, Stats } from "./types";
+import type { TrackedItem, DuplicateGroup, Task, Stats, IgnoredResource } from "./types";
 import { isFilterId } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -14,6 +14,7 @@ interface WindowState {
   items: TrackedItem[];
   duplicates: DuplicateGroup[];
   stats: Stats | null;
+  ignored: IgnoredResource[];
   loading: boolean;
   error: string | null;
 
@@ -22,12 +23,15 @@ interface WindowState {
   closeDuplicates: (groupIds: string[], keepItemIds?: string[]) => number;
   focusWindow: (itemId: string) => Promise<void>;
   closeWindow: (itemId: string) => void;
+  ignoreItem: (itemId: string) => Promise<void>;
+  unignoreResource: (resourceKey: string) => Promise<void>;
 }
 
 export const useWindowStore = create<WindowState>((set, get) => ({
   items: [],
   duplicates: [],
   stats: null,
+  ignored: [],
   loading: false,
   error: null,
 
@@ -48,6 +52,11 @@ export const useWindowStore = create<WindowState>((set, get) => ({
     try {
       const stats = await invoke<Stats>("get_stats");
       set({ stats });
+    } catch (_) {}
+
+    try {
+      const ignored = await invoke<IgnoredResource[]>("get_ignored_resources");
+      set({ ignored });
     } catch (_) {}
   },
 
@@ -108,6 +117,29 @@ export const useWindowStore = create<WindowState>((set, get) => ({
       });
 
     return matchedGroups.reduce((sum, g) => sum + g.items.length - 1, 0);
+  },
+
+  ignoreItem: async (itemId) => {
+    try {
+      await invoke("ignore_item", { itemId });
+      // The item vanishes from every view; reload list, warnings and stats
+      await get().refresh();
+      await get().detectDuplicates();
+    } catch (e) {
+      console.error("[TabFlow] ignoreItem failed:", e);
+      set({ error: `忽略追踪失败: ${e}` });
+    }
+  },
+
+  unignoreResource: async (resourceKey) => {
+    try {
+      await invoke("unignore_resource", { resourceKey });
+      await get().refresh();
+      await get().detectDuplicates();
+    } catch (e) {
+      console.error("[TabFlow] unignoreResource failed:", e);
+      set({ error: `取消忽略失败: ${e}` });
+    }
   },
 
   focusWindow: async (itemId) => {

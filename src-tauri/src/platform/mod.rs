@@ -46,6 +46,14 @@ impl ItemType {
     }
 }
 
+/// Resource the user removed from tracking (ignore list entry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredResource {
+    pub resource_key: String,
+    pub title: String,
+    pub created_at: String,
+}
+
 /// Duplicate group info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateGroup {

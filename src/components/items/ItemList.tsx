@@ -1,8 +1,9 @@
 import { useMemo } from "react";
 import { useWindowStore, useTaskStore } from "@/stores";
-import { FILTER_APP, FILTER_BROWSER, FILTER_EXPLORER } from "@/stores/types";
+import { FILTER_APP, FILTER_BROWSER, FILTER_EXPLORER, FILTER_IGNORED } from "@/stores/types";
 import { ItemCard } from "./ItemCard";
 import { DuplicateGroup } from "./DuplicateGroup";
+import { IgnoredList } from "./IgnoredList";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Sparkles, AlertCircle, Loader2 } from "lucide-react";
@@ -10,6 +11,11 @@ import { Sparkles, AlertCircle, Loader2 } from "lucide-react";
 export function ItemList() {
   const { items, duplicates, loading, error, closeDuplicates } = useWindowStore();
   const { selectedTaskId, taskItems } = useTaskStore();
+
+  // The ignore-list management view replaces the item list entirely.
+  if (selectedTaskId === FILTER_IGNORED) {
+    return <IgnoredList />;
+  }
 
   // Filter by selected task/type
   const filtered = useMemo(() => {

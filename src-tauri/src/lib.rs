@@ -74,6 +74,9 @@ pub fn run() {
             tasks::unassign_item_from_task,
             tasks::get_task_items,
             db::get_stats,
+            db::ignore_item,
+            db::unignore_resource,
+            db::get_ignored_resources,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TabFlow");
