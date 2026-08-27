@@ -10,6 +10,15 @@ mod db;
 
 use tauri::{Emitter, Manager};
 
+/// Bring the main window back from hidden/minimized (tray restore).
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -48,6 +57,48 @@ pub fn run() {
                 if let Ok(hwnd) = window.hwnd() {
                     platform::restore_system_menu(hwnd.0 as isize);
                 }
+            }
+
+            // Tray icon (built in code - the config only carried icon and
+            // tooltip, no behavior). Left click restores the window, right
+            // click offers show/quit, and closing the window hides it to
+            // the tray instead of exiting the app.
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{
+                MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
+            };
+            let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            TrayIconBuilder::with_id("tabflow-tray")
+                .icon(app.default_window_icon().expect("window icon").clone())
+                .tooltip("TabFlow")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button, button_state, .. } = event {
+                        if button == MouseButton::Left
+                            && button_state == MouseButtonState::Up
+                        {
+                            show_main_window(tray.app_handle());
+                        }
+                    }
+                })
+                .build(app)?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let w = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
             }
 
             // System-wide Ctrl+Shift+F toggles the search overlay.

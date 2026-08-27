@@ -26,11 +26,6 @@
         "shadow": true
       }
     ],
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": false,
-      "tooltip": "TabFlow"
-    },
     "security": {
       "csp": null
     }
