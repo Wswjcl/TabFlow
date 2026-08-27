@@ -25,8 +25,11 @@ export function TitleBar() {
       data-tauri-drag-region
       className="flex items-center justify-between h-9 px-3 bg-card border-b select-none shrink-0"
     >
-      {/* Left: App name */}
-      <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+      {/* Left: App name (drag region too, so the whole left area moves the window) */}
+      <div
+        data-tauri-drag-region
+        className="flex items-center gap-2 text-sm font-medium text-muted-foreground"
+      >
         <span className="text-foreground font-semibold">TabFlow</span>
       </div>
 
