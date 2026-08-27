@@ -12,11 +12,6 @@ export function ItemList() {
   const { items, duplicates, loading, error, closeDuplicates } = useWindowStore();
   const { selectedTaskId, taskItems } = useTaskStore();
 
-  // The ignore-list management view replaces the item list entirely.
-  if (selectedTaskId === FILTER_IGNORED) {
-    return <IgnoredList />;
-  }
-
   // Filter by selected task/type
   const filtered = useMemo(() => {
     if (selectedTaskId === FILTER_BROWSER) {
@@ -76,6 +71,13 @@ export function ItemList() {
     const allGroupIds = scopedDuplicates.flatMap((g) => [g.id, g.match_pattern]);
     await closeDuplicates(allGroupIds);
   };
+
+  // The ignore-list management view replaces the item list entirely.
+  // (Kept below every hook: an early return above them would break the
+  // Rules of Hooks and white-screen the app on view switches.)
+  if (selectedTaskId === FILTER_IGNORED) {
+    return <IgnoredList />;
+  }
 
   // ── Loading ──
   if (loading && items.length === 0) {
