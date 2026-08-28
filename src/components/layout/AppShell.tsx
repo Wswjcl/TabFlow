@@ -29,6 +29,9 @@ export function AppShell() {
     listen("windows-updated", () => {
       refresh();
       detectDuplicates();
+      // Task badges count live pages; without this they only update on
+      // manual assign/unassign and jump when the user cancels tracking.
+      loadTasks();
       setLastRefresh(new Date().toLocaleTimeString());
     }).then((fn) => unlisteners.push(fn));
 
