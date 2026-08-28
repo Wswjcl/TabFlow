@@ -1,6 +1,6 @@
 [package]
 name = "tabflow"
-version = "0.1.0"
+version = "0.1.1"
 description = "Smart window and tab deduplication manager"
 authors = ["TabFlow"]
 edition = "2021"
