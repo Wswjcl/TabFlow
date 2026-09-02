@@ -5,6 +5,7 @@ import {
   ExternalLink,
   X,
   Copy,
+  Pencil,
 } from "lucide-react";
 import type { TrackedItem } from "@/stores/types";
 import { itemTypeIcon, browserIcon } from "@/stores/types";
@@ -45,6 +46,9 @@ export function ItemCard({ item }: ItemCardProps) {
     ?.replace(/^title:/, "")
     ?.slice(0, 60);
 
+  // The user's note replaces the live title as the display name
+  const displayTitle = item.note?.trim() || item.title;
+
   const fallbackIcon =
     item.item_type === "browser_tab"
       ? browserIcon(item.browser_name)
@@ -76,7 +80,20 @@ export function ItemCard({ item }: ItemCardProps) {
 
       {/* Content */}
       <div className="flex-1 min-w-0">
-        <div className="text-sm font-medium truncate">{item.title}</div>
+        <div
+          className="text-sm font-medium truncate"
+          title={item.note ? `原名称：${item.title}` : undefined}
+        >
+          {item.note && (
+            <Pencil className="w-3 h-3 inline mr-1 -mt-0.5 text-blue-500/80" />
+          )}
+          {displayTitle}
+        </div>
+        {item.note && (
+          <div className="text-xs text-muted-foreground/70 truncate">
+            {item.title}
+          </div>
+        )}
         {displayUrl && (
           <div className="text-xs text-muted-foreground truncate">
             {displayUrl}

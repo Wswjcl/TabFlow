@@ -39,9 +39,20 @@ pub fn resource_key(item: &TrackedItem) -> String {
         ItemType::AppWindow => format!(
             "app:{}:{}",
             item.process_name.to_lowercase(),
-            item.title.to_lowercase()
+            normalize_app_title(&item.title)
         ),
     }
+}
+
+/// App window titles carry transient decorations: unsaved-file markers
+/// ("● ", "* ") flip on every keystroke/save and would churn the identity
+/// key, detaching task assignments. Strip leading marker characters before
+/// hashing so "● report.md - proj" and "report.md - proj" are one resource.
+fn normalize_app_title(title: &str) -> String {
+    title
+        .trim_start_matches(['●', '•', '*', '○', '◦', '·'])
+        .trim()
+        .to_lowercase()
 }
 
 /// Normalize a URL for duplicate comparison:
@@ -258,6 +269,7 @@ mod tests {
             browser_name: Some(browser.to_string()),
             last_active_at: Utc::now().to_rfc3339(),
             icon: None,
+            note: None,
             task_ids: Vec::new(),
         }
     }
@@ -312,5 +324,36 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].count, 2);
         assert_eq!(groups[0].match_pattern, "url:http://example.com/manual");
+    }
+
+    /// Unsaved-file markers (VSCode "● ", classic "* ") flip on every
+    /// save/keystroke. The identity key must ignore them, otherwise task
+    /// assignments detach the moment the user starts typing.
+    #[test]
+    fn app_title_dirty_marker_is_transient() {
+        fn app(title: &str) -> TrackedItem {
+            TrackedItem {
+                id: "hwnd_1".to_string(),
+                title: title.to_string(),
+                url: None,
+                path: None,
+                process_name: "Code.exe".to_string(),
+                window_handle: Some(1),
+                item_type: ItemType::AppWindow,
+                browser_name: None,
+                last_active_at: Utc::now().to_rfc3339(),
+                icon: None,
+                note: None,
+                task_ids: Vec::new(),
+            }
+        }
+        assert_eq!(
+            resource_key(&app("● report.md - proj - Visual Studio Code")),
+            resource_key(&app("report.md - proj - Visual Studio Code"))
+        );
+        assert_ne!(
+            resource_key(&app("report.md - proj - Visual Studio Code")),
+            resource_key(&app("other.md - proj - Visual Studio Code"))
+        );
     }
 }

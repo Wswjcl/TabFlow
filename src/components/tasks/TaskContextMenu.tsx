@@ -1,7 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useTaskStore, useWindowStore } from "@/stores";
 import type { TrackedItem } from "@/stores/types";
-import { Check, EyeOff, FolderKanban } from "lucide-react";
+import { Check, EyeOff, FolderKanban, Pencil, X } from "lucide-react";
+import { NoteDialog } from "@/components/items/NoteDialog";
 
 interface Props {
   x: number;
@@ -11,12 +12,14 @@ interface Props {
 }
 
 /** Right-click menu on an item: toggle which tasks track this resource,
- *  or stop tracking it entirely. */
+ *  annotate (rename) it, or stop tracking it entirely. */
 export function TaskContextMenu({ x, y, item, onClose }: Props) {
   const tasks = useTaskStore((s) => s.tasks);
   const assignToTask = useTaskStore((s) => s.assignToTask);
   const unassignFromTask = useTaskStore((s) => s.unassignFromTask);
   const ignoreItem = useWindowStore((s) => s.ignoreItem);
+  const setResourceNote = useWindowStore((s) => s.setResourceNote);
+  const [noteOpen, setNoteOpen] = useState(false);
   const assigned = new Set(item.task_ids);
 
   useEffect(() => {
@@ -35,6 +38,11 @@ export function TaskContextMenu({ x, y, item, onClose }: Props) {
     }
     onClose();
   };
+
+  // The dialog replaces the menu; Escape inside it closes everything.
+  if (noteOpen) {
+    return <NoteDialog item={item} onClose={onClose} />;
+  }
 
   // Keep the menu inside the viewport
   const left = Math.min(x, window.innerWidth - 200);
@@ -88,6 +96,29 @@ export function TaskContextMenu({ x, y, item, onClose }: Props) {
             )}
           </button>
         ))}
+
+        {/* Annotate: custom display name for this resource */}
+        <div className="my-1 border-t border-border/60" />
+        <button
+          onClick={() => setNoteOpen(true)}
+          className="flex items-center gap-2 w-full px-3 py-1.5 hover:bg-accent transition-colors text-left"
+          title="给此页面起一个备注名，显示时替代原标题"
+        >
+          <Pencil className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+          <span className="flex-1">{item.note ? "编辑备注" : "备注 / 重命名"}</span>
+        </button>
+        {item.note && (
+          <button
+            onClick={() => {
+              setResourceNote(item.id, "");
+              onClose();
+            }}
+            className="flex items-center gap-2 w-full px-3 py-1.5 hover:bg-accent transition-colors text-left"
+          >
+            <X className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+            <span className="flex-1">清除备注</span>
+          </button>
+        )}
 
         {/* Ignore tracking: removes this resource from the app entirely */}
         <div className="my-1 border-t border-border/60" />

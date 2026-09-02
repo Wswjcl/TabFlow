@@ -134,6 +134,7 @@ pub fn run() {
             tasks::unassign_item_from_task,
             tasks::get_task_items,
             db::get_stats,
+            db::set_resource_note,
             db::ignore_item,
             db::unignore_resource,
             db::get_ignored_resources,

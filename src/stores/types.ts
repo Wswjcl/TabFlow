@@ -12,6 +12,8 @@ export interface TrackedItem {
   last_active_at: string;
   /** Real app icon as a PNG data URL (null → emoji fallback) */
   icon: string | null;
+  /** User annotation shown instead of the title (backend-attached) */
+  note: string | null;
   /** Task ids assigned to this item's resource (backend-attached) */
   task_ids: string[];
 }

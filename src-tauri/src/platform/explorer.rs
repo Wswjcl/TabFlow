@@ -131,7 +131,8 @@ unsafe fn enumerate_via_shell_windows() -> Result<Vec<TrackedItem>, ()> {
             browser_name: None,
             last_active_at: now.clone(),
             icon: None,
-            task_ids: Vec::new(),
+            note: None,
+                task_ids: Vec::new(),
         });
     }
 

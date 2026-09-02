@@ -91,6 +91,14 @@ pub async fn init_db(data_dir: Option<std::path::PathBuf>) -> Result<(), Box<dyn
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- User annotations (custom names) per resource key. Shown instead of
+        -- the live title; carried over when an instance's key migrates.
+        CREATE TABLE IF NOT EXISTS resource_notes (
+            resource_key TEXT PRIMARY KEY,
+            note TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tracked_items_type ON tracked_items(item_type);
         CREATE INDEX IF NOT EXISTS idx_tracked_items_process ON tracked_items(process_name);
         CREATE INDEX IF NOT EXISTS idx_tracked_items_title ON tracked_items(title);
@@ -121,6 +129,7 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
         browser_name: row.get("browser_name"),
         last_active_at: row.get("last_active_at"),
         icon: None,
+        note: None,
         task_ids: Vec::new(),
     }
 }
@@ -153,16 +162,60 @@ async fn attach_task_ids(items: &mut Vec<TrackedItem>) {
 /// duplicates, search, stats) reads through this.
 async fn hydrate_items(mut items: Vec<TrackedItem>) -> Vec<TrackedItem> {
     attach_task_ids(&mut items).await;
+    let notes: HashMap<String, String> =
+        match sqlx::query_as("SELECT resource_key, note FROM resource_notes")
+            .fetch_all(pool().await)
+            .await
+        {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(_) => HashMap::new(),
+        };
     let ignored = load_ignored_keys().await;
     if !ignored.is_empty() {
         items.retain(|item| !ignored.contains(&crate::duplicate::resource_key(item)));
     }
     for item in items.iter_mut() {
+        let key = crate::duplicate::resource_key(item);
+        if let Some(note) = notes.get(&key) {
+            item.note = Some(note.clone());
+        }
         if item.icon.is_none() {
             item.icon = crate::platform::process_icon(&item.process_name);
         }
     }
     items
+}
+
+/// Set (empty string clears) the user note on an item's resource. The note
+/// is keyed by the resource's stable key, so it survives the window closing
+/// and reattaches when the same page/file is opened again.
+#[tauri::command]
+pub async fn set_resource_note(item_id: String, note: String) -> Result<(), String> {
+    set_resource_note_inner(&item_id, &note)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn set_resource_note_inner(item_id: &str, note: &str) -> Result<(), sqlx::Error> {
+    let resource_key = resolve_resource_key(item_id).await?;
+    let note = note.trim();
+    if note.is_empty() {
+        sqlx::query("DELETE FROM resource_notes WHERE resource_key = ?")
+            .bind(&resource_key)
+            .execute(pool().await)
+            .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO resource_notes (resource_key, note, created_at) \
+             VALUES (?, ?, datetime('now')) \
+             ON CONFLICT(resource_key) DO UPDATE SET note = excluded.note",
+        )
+        .bind(&resource_key)
+        .bind(note)
+        .execute(pool().await)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn load_ignored_keys() -> std::collections::HashSet<String> {
@@ -198,6 +251,50 @@ pub async fn get_all_tracked_items() -> Result<Vec<TrackedItem>, sqlx::Error> {
 /// half-updated list.
 pub async fn sync_items(items: &[TrackedItem]) -> Result<(), sqlx::Error> {
     let mut tx = pool().await.begin().await?;
+
+    // Identity migration: an instance's resource key can change while the
+    // instance itself stays open — a tab navigating in place (stable
+    // ext_{browser}_{tabId} id) or an app window whose title changed
+    // (stable hwnd_ id, e.g. VSCode switching files). Task assignments
+    // and the user note are keyed by resource key and would silently
+    // detach; carry them over to the new key so tracking follows what
+    // the user is doing, not the exact URL/title string. Copy, not move:
+    // the old key may still be open in another window/tab.
+    let old_rows = sqlx::query(&format!("SELECT {ITEM_COLUMNS} FROM tracked_items"))
+        .fetch_all(&mut *tx)
+        .await?;
+    let old_keys: HashMap<String, String> = old_rows
+        .iter()
+        .map(|r| {
+            let item = row_to_item(r);
+            (item.id.clone(), crate::duplicate::resource_key(&item))
+        })
+        .collect();
+    for item in items {
+        let new_key = crate::duplicate::resource_key(item);
+        let Some(old_key) = old_keys.get(&item.id) else {
+            continue;
+        };
+        if *old_key == new_key {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO item_tasks (resource_key, task_id) \
+             SELECT ?1, task_id FROM item_tasks WHERE resource_key = ?2",
+        )
+        .bind(&new_key)
+        .bind(old_key)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO resource_notes (resource_key, note, created_at) \
+             SELECT ?1, note, created_at FROM resource_notes WHERE resource_key = ?2",
+        )
+        .bind(&new_key)
+        .bind(old_key)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     for item in items {
         sqlx::query(
@@ -290,6 +387,39 @@ pub async fn search_items(query: &str) -> Result<Vec<TrackedItem>, sqlx::Error> 
     .await?;
 
     let items: Vec<TrackedItem> = rows.iter().map(|r| row_to_item(r)).collect();
+    search_note_matches(items, &pattern).await
+}
+
+/// Extend text search results with rows whose user note matches the query
+/// (notes live on resource keys, which are computed in Rust, so the
+/// note-matching half runs outside the LIKE query). Deduped by id.
+async fn search_note_matches(
+    mut items: Vec<TrackedItem>,
+    pattern: &str,
+) -> Result<Vec<TrackedItem>, sqlx::Error> {
+    let note_keys: HashSet<String> =
+        sqlx::query_as::<_, (String,)>("SELECT resource_key FROM resource_notes WHERE note LIKE ? ESCAPE '\\'")
+            .bind(pattern)
+            .fetch_all(pool().await)
+            .await?
+            .into_iter()
+            .map(|(k,)| k)
+            .collect();
+    if !note_keys.is_empty() {
+        let present: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+        let all = sqlx::query(&format!("SELECT {ITEM_COLUMNS} FROM tracked_items"))
+            .fetch_all(pool().await)
+            .await?;
+        for row in &all {
+            let item = row_to_item(row);
+            if !present.contains(&item.id)
+                && note_keys.contains(&crate::duplicate::resource_key(&item))
+            {
+                items.push(item);
+            }
+        }
+    }
+    items.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at).then(a.id.cmp(&b.id)));
     Ok(hydrate_items(items).await)
 }
 

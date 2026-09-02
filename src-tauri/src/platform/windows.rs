@@ -228,7 +228,8 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         browser_name,
         last_active_at: Utc::now().to_rfc3339(),
         icon: None,
-        task_ids: Vec::new(),
+        note: None,
+                task_ids: Vec::new(),
     });
 
     TRUE

@@ -25,6 +25,7 @@ interface WindowState {
   closeWindow: (itemId: string) => void;
   ignoreItem: (itemId: string) => Promise<void>;
   unignoreResource: (resourceKey: string) => Promise<void>;
+  setResourceNote: (itemId: string, note: string) => Promise<void>;
 }
 
 export const useWindowStore = create<WindowState>((set, get) => ({
@@ -139,6 +140,16 @@ export const useWindowStore = create<WindowState>((set, get) => ({
     } catch (e) {
       console.error("[TabFlow] unignoreResource failed:", e);
       set({ error: `取消忽略失败: ${e}` });
+    }
+  },
+
+  setResourceNote: async (itemId, note) => {
+    try {
+      await invoke("set_resource_note", { itemId, note });
+      await get().refresh();
+    } catch (e) {
+      console.error("[TabFlow] setResourceNote failed:", e);
+      set({ error: `保存备注失败: ${e}` });
     }
   },
 

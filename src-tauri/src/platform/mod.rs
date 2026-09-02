@@ -16,6 +16,10 @@ pub struct TrackedItem {
     /// attached when rows leave the DB; not persisted). None → emoji fallback.
     #[serde(default)]
     pub icon: Option<String>,
+    /// User annotation shown instead of the live title (per resource key,
+    /// filled by db queries; survives navigation and app restarts).
+    #[serde(default)]
+    pub note: Option<String>,
     /// Tasks this item's resource is assigned to (filled by db queries)
     pub task_ids: Vec<String>,
 }
