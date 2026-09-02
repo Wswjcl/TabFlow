@@ -80,20 +80,19 @@ export function ItemCard({ item }: ItemCardProps) {
 
       {/* Content */}
       <div className="flex-1 min-w-0">
-        <div
-          className="text-sm font-medium truncate"
-          title={item.note ? `原名称：${item.title}` : undefined}
-        >
+        {/* Note replaces the title as display name; the original moves to
+            the hover tooltip so the card keeps its normal 2-line height */}
+        <div className="text-sm font-medium truncate flex items-center gap-1">
           {item.note && (
-            <Pencil className="w-3 h-3 inline mr-1 -mt-0.5 text-blue-500/80" />
+            <Pencil className="w-3 h-3 shrink-0 text-blue-500/80" />
           )}
-          {displayTitle}
+          <span
+            className={`truncate ${item.note ? "text-blue-600 dark:text-blue-400" : ""}`}
+            title={item.note ? `原名称：${item.title}` : undefined}
+          >
+            {displayTitle}
+          </span>
         </div>
-        {item.note && (
-          <div className="text-xs text-muted-foreground/70 truncate">
-            {item.title}
-          </div>
-        )}
         {displayUrl && (
           <div className="text-xs text-muted-foreground truncate">
             {displayUrl}
