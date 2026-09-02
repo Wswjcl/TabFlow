@@ -87,7 +87,7 @@ export function ItemCard({ item }: ItemCardProps) {
             <Pencil className="w-3 h-3 shrink-0 text-blue-500/80" />
           )}
           <span
-            className={`truncate ${item.note ? "text-blue-600 dark:text-blue-400" : ""}`}
+            className="truncate"
             title={item.note ? `原名称：${item.title}` : undefined}
           >
             {displayTitle}
