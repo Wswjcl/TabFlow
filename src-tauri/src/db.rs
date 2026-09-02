@@ -93,6 +93,8 @@ pub async fn init_db(data_dir: Option<std::path::PathBuf>) -> Result<(), Box<dyn
 
         -- User annotations (custom names) per resource key. Shown instead of
         -- the live title; carried over when an instance's key migrates.
+        -- EPHEMERAL by design: rows are pruned when the resource is no
+        -- longer open (see sync_items), so notes never outlive windows.
         CREATE TABLE IF NOT EXISTS resource_notes (
             resource_key TEXT PRIMARY KEY,
             note TEXT NOT NULL,
@@ -107,6 +109,11 @@ pub async fn init_db(data_dir: Option<std::path::PathBuf>) -> Result<(), Box<dyn
     )
     .execute(&pool)
     .await?;
+
+    // Notes are session-scoped: never resurrect them across app restarts.
+    sqlx::query("DELETE FROM resource_notes")
+        .execute(&pool)
+        .await?;
 
     DB_POOL
         .set(pool)
@@ -186,9 +193,9 @@ async fn hydrate_items(mut items: Vec<TrackedItem>) -> Vec<TrackedItem> {
     items
 }
 
-/// Set (empty string clears) the user note on an item's resource. The note
-/// is keyed by the resource's stable key, so it survives the window closing
-/// and reattaches when the same page/file is opened again.
+/// Set (empty string clears) the user note on an item's resource. Notes are
+/// ephemeral: sync_items prunes notes whose resource is no longer open, so
+/// closing the window (or the app) discards them.
 #[tauri::command]
 pub async fn set_resource_note(item_id: String, note: String) -> Result<(), String> {
     set_resource_note_inner(&item_id, &note)
@@ -336,6 +343,26 @@ pub async fn sync_items(items: &[TrackedItem]) -> Result<(), sqlx::Error> {
             query = query.bind(id);
         }
         query.execute(&mut *tx).await?;
+    }
+
+    // Notes annotate currently-open resources and are deliberately NOT
+    // persistent: prune notes whose resource is no longer live so a note
+    // never outlives its window (close it / reopen the page → fresh).
+    let live_keys: HashSet<String> = items
+        .iter()
+        .map(|i| crate::duplicate::resource_key(i))
+        .collect();
+    let note_keys: Vec<(String,)> =
+        sqlx::query_as("SELECT resource_key FROM resource_notes")
+            .fetch_all(&mut *tx)
+            .await?;
+    for (key,) in note_keys {
+        if !live_keys.contains(&key) {
+            sqlx::query("DELETE FROM resource_notes WHERE resource_key = ?")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     tx.commit().await

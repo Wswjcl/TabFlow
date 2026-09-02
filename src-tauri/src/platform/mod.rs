@@ -17,7 +17,7 @@ pub struct TrackedItem {
     #[serde(default)]
     pub icon: Option<String>,
     /// User annotation shown instead of the live title (per resource key,
-    /// filled by db queries; survives navigation and app restarts).
+    /// filled by db queries; lives only while the resource stays open).
     #[serde(default)]
     pub note: Option<String>,
     /// Tasks this item's resource is assigned to (filled by db queries)
